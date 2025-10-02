@@ -39,6 +39,7 @@ ADMIN_DEEPLINK_TOKEN = os.getenv("ADMIN_DEEPLINK_TOKEN", "changeme_admin_token")
 SECRET_HMAC_KEY = os.getenv("SECRET_HMAC_KEY", "replace_with_strong_random_string")
 SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", "0") or "0")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
+GOOGLE_SA_PATH = '/etc/secrets/gsheets.json'
 
 # Вікна перевірки (щоб не пропустити момент)
 REMINDER24_WINDOW_MIN = (23*60-10, 24*60+10)  # 23:50..24:10 до старту
@@ -62,13 +63,24 @@ tz = pytz.timezone(TIMEZONE)
 
 # ======================= Google Sheets =======================
 def _get_gspread_client():
-    sa_path = os.getenv("GOOGLE_SA_PATH", "/etc/secrets/gsheets.json")
+    sa_json = os.getenv("gsheets.json", "").strip()
+    sa_path = os.getenv("GOOGLE_SA_PATH", "/etc/secrets/gsheets.json").strip()
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
+        "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_file(sa_path, scopes=scopes)
+    if sa_json:
+        try:
+            data = json.loads(sa_json)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"GOOGLE_SA_JSON is invalid JSON: {e}")
+        creds = Credentials.from_service_account_info(data, scopes=scopes)
+    else:
+        if not os.path.exists(sa_path):
+            raise RuntimeError(f"Service account file not found at {sa_path}")
+        creds = Credentials.from_service_account_file(sa_path, scopes=scopes)
     return gspread.authorize(creds)
+
 
 
 _gc = None
