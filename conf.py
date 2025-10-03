@@ -152,24 +152,37 @@ def _upsert_rsvp(event_id: str, client_id: str, patch: Dict[str, str]):
                "rsvp":"", "remind_24h":"", "reminded_24h":"", "reminded_60m":"", "rsvp_at":""}
         row.update(patch)
         _append(sh, row)
-# >>> додай десь поруч із іншими утилітами для Sheets
 
+# ---- EventTypes titles + діагностика ----
 def _active_eventtypes_titles() -> List[str]:
     try:
         ws = gs().worksheet(SHEET_EVENTTYPES)
         rows = _read_all(ws)
-        titles = []
+        titles: List[str] = []
+        total = len(rows)
+        active_count = 0
         for r in rows:
-            active = str(r.get("active", "")).strip().lower() in ("1", "true", "yes")
-            if not active:
-                continue
             title = (r.get("title") or r.get("type") or r.get("type_code") or "").strip()
-            if title:
+            if not title:
+                continue
+            # М'який фільтр: якщо колонки/значення active немає — вважаємо активним
+            raw_active = r.get("active")
+            is_on = True if (raw_active is None or str(raw_active).strip()=="") else (str(raw_active).strip().lower() in ("1","true","yes","y"))
+            if is_on:
                 titles.append(title)
+                active_count += 1
+        try:
+            _delivery_log("diag_eventtypes", "-", "-", f"found={total}, active={active_count}, titles={len(titles)}")
+        except Exception:
+            pass
         return titles
-    except Exception:
+    except Exception as e:
+        try:
+            _delivery_log("diag_eventtypes_fail", "-", "-", f"{e}")
+        except Exception:
+            pass
         return []
-      
+
 # ============================== Phase 1: Onboarding ===========================
 
 onboarding_router = Router(name="onboarding")
@@ -243,21 +256,28 @@ async def ob_name(message: Message, state: FSMContext):
         "_Напр.: +380671234567_"
     )
     await state.set_state(Onboard.ask_phone)
+
 async def _send_welcome_with_eventtypes(chat_id: int):
     titles = _active_eventtypes_titles()
     if titles:
         lst = "\n".join([f"• {t}" for t in titles])
-        txt_list = f"📅 *Наші регулярні конференції:*\n{lst}\n\n"
+        try:
+            await bot.send_message(chat_id, f"📅 *Наші регулярні конференції:*\n{lst}\n")
+        except Exception:
+            pass
     else:
-        txt_list = ""
-    friendly = ("🎉 Готово! Ви додані до системи.\n"
-                "Очікуйте запрошення на конференції — вони прийдуть у цей бот найближчим часом.")
+        # явний фолбек — щоб не виглядало, ніби «забули»
+        try:
+            await bot.send_message(chat_id, "📅 Поки що немає опублікованих типів зустрічей (EventTypes). Скоро додамо 👇")
+        except Exception:
+            pass
     try:
-        if txt_list:
-            await bot.send_message(chat_id, txt_list)
-        await bot.send_message(chat_id, friendly)
+        await bot.send_message(
+            chat_id,
+            "🎉 Готово! Ви додані до системи.\n"
+            "Очікуйте запрошення на конференції — вони прийдуть у цей бот найближчим часом."
+        )
     except Exception:
-        # м’яко ігноруємо — реєстрація вже пройшла
         pass
 
 @onboarding_router.message(Onboard.ask_phone)
@@ -275,6 +295,7 @@ async def ob_phone(message: Message, state: FSMContext):
     try:
         ws = gs().worksheet(SHEET_CLIENTS)
 
+        # 1) tg вже є — оновлюємо та шлемо список + вітання
         existing_by_tg = _find_rows(ws, lambda r: (r.get("tg_user_id") or "") == me_tg)
         if existing_by_tg:
             rownum, _ = existing_by_tg[0]
@@ -286,6 +307,7 @@ async def ob_phone(message: Message, state: FSMContext):
             await state.clear()
             return
 
+        # 2) шукаємо за телефоном
         norm = _norm_phone_val
         by_phone = _find_rows(ws, lambda r: norm(r.get("phone") or "") == norm(phone))
         if by_phone:
@@ -315,7 +337,6 @@ async def ob_phone(message: Message, state: FSMContext):
                     "Якщо ви вже працювали з нами раніше — ми перевіримо дані."
                 )
                 await _send_welcome_with_eventtypes(int(message.from_user.id))
-
                 try:
                     if SUPPORT_CHAT_ID:
                         await message.bot.send_message(
@@ -329,6 +350,7 @@ async def ob_phone(message: Message, state: FSMContext):
                 except Exception:
                     pass
         else:
+            # 3) повністю новий клієнт
             client_id = f"cl_{message.from_user.id}"
             _append(ws, {
                 "client_id": client_id,
@@ -407,18 +429,28 @@ async def admin_start_gate(message: Message, state: FSMContext):
     if not payload.startswith("admin_"):
         return
     token = unquote(payload[len("admin_"):])
-    if message.from_user.id in ADMIN_IDS and token == ADMIN_DEEPLINK_TOKEN:
+    is_admin = message.from_user.id in ADMIN_IDS
+    token_ok = (token == ADMIN_DEEPLINK_TOKEN)
+    if is_admin and token_ok:
         await _show_admin_menu(message)
     else:
-        await message.answer("⛔️ Команда недоступна.")
+        # Дружній діагностичний фідбек (щоб швидко знайти проблему в ENV)
+        await message.answer(f"⛔️ Команда недоступна.\n_is_admin={is_admin}, token_ok={token_ok}_")
 
 @admin_router.message(Command("admin"))
 async def admin_cmd(message: Message):
     if message.chat.type != "private":
         return
     if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔️ Лише для адмінів.")
         return
     await _show_admin_menu(message)
+
+# допоміжна: швидко дізнатись свій ID
+@admin_router.message(Command("myid"))
+async def my_id(message: Message):
+    if message.chat.type == "private":
+        await message.answer(f"Ваш Telegram ID: `{message.from_user.id}`")
 
 async def _show_admin_menu(message: Message):
     kb = InlineKeyboardBuilder()
@@ -456,7 +488,8 @@ async def add_event_start(cb: CallbackQuery, state: FSMContext):
         await state.update_data(types=types)
         kb = InlineKeyboardBuilder()
         for r in types[:50]:
-            code = r.get("type_code"); title = r.get("title") or code
+            code = r.get("type_code") or r.get("type")
+            title = r.get("title") or code
             kb.button(text=f"{title}", callback_data=f"admin:add:type:{code}")
         kb.button(text="↩️ Назад", callback_data="admin:back")
         kb.adjust(1)
@@ -554,7 +587,7 @@ async def add_event_save(cb: CallbackQuery, state: FSMContext):
         return
     try:
         wt = gs().worksheet(SHEET_EVENTTYPES)
-        trow = next((r for r in _read_all(wt) if r.get("type_code") == ev["type"]), None)
+        trow = next((r for r in _read_all(wt) if (r.get("type_code") or r.get("type")) == ev["type"]), None)
         if trow:
             if not ev.get("title"): ev["title"] = trow.get("title","")
             if not ev.get("description"): ev["description"] = trow.get("description","")
@@ -662,7 +695,6 @@ async def update_choose_field(cb: CallbackQuery, state: FSMContext):
 @_admin_only
 async def update_enter_value_prompt(cb: CallbackQuery, state: FSMContext):
     fld = cb.data.split(":")[-1]
-    d = await state.get_data()
     await state.update_data(field=fld)
     hint = {
         "start_at": "у форматі `YYYY-MM-DD HH:MM` (Київ)",
@@ -1036,9 +1068,12 @@ def setup_phase3(dp, scheduler=None, bot_instance=None):
     if bot_instance is not None:
         init_phase3(bot_instance)
     if scheduler is not None:
-        scheduler.add_job(job_broadcast_new, "interval", minutes=1, id="broadcast_new", replace_existing=True)
-        scheduler.add_job(job_reminder_24h, "interval", minutes=5, id="reminder_24h", replace_existing=True)
-        scheduler.add_job(job_reminder_60m, "interval", minutes=1, id="reminder_60m", replace_existing=True)
+        scheduler.add_job(job_broadcast_new, "interval", minutes=1, id="broadcast_new",
+                          replace_existing=True, coalesce=True, misfire_grace_time=30)
+        scheduler.add_job(job_reminder_24h, "interval", minutes=5, id="reminder_24h",
+                          replace_existing=True, coalesce=True, misfire_grace_time=30)
+        scheduler.add_job(job_reminder_60m, "interval", minutes=1, id="reminder_60m",
+                          replace_existing=True, coalesce=True, misfire_grace_time=30)
 
 # ============================== Phase 4: Feedback/Escalation ==================
 
@@ -1315,7 +1350,8 @@ def setup_phase4(dp, scheduler=None, bot_instance=None):
     if bot_instance is not None:
         init_phase4(bot_instance)
     if scheduler is not None:
-        scheduler.add_job(job_feedback_ask, "interval", minutes=5, id="feedback_ask", replace_existing=True)
+        scheduler.add_job(job_feedback_ask, "interval", minutes=5, id="feedback_ask",
+                          replace_existing=True, coalesce=True, misfire_grace_time=30)
 
 # ============================== Phase 5: Polish (/help, quiet hours opt-in) ===
 
@@ -1377,12 +1413,15 @@ def main():
     # Підключаємо роутери
     dp.include_router(onboarding_router)   # /start + онбординг
     dp.include_router(admin_router)        # адмін-панель
-    setup_phase3(dp, None, bot)            # Фаза 3 (router + потім scheduler нижче)
-    setup_phase4(dp, None, bot)            # Фаза 4 (router + потім scheduler нижче)
+    setup_phase3(dp, None, bot)            # Фаза 3 (router + scheduler нижче)
+    setup_phase4(dp, None, bot)            # Фаза 4 (router + scheduler нижче)
     dp.include_router(phase5_router)       # /help, /profile
 
     # Планувальник
-    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    scheduler = AsyncIOScheduler(
+        timezone=TIMEZONE,
+        job_defaults={"coalesce": True, "misfire_grace_time": 30}
+    )
     scheduler.add_job(job_broadcast_new, "interval", minutes=1, id="broadcast_new", replace_existing=True)
     scheduler.add_job(job_reminder_24h, "interval", minutes=5, id="reminder_24h", replace_existing=True)
     scheduler.add_job(job_reminder_60m, "interval", minutes=1, id="reminder_60m", replace_existing=True)
