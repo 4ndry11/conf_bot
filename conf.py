@@ -152,7 +152,24 @@ def _upsert_rsvp(event_id: str, client_id: str, patch: Dict[str, str]):
                "rsvp":"", "remind_24h":"", "reminded_24h":"", "reminded_60m":"", "rsvp_at":""}
         row.update(patch)
         _append(sh, row)
+# >>> додай десь поруч із іншими утилітами для Sheets
 
+def _active_eventtypes_titles() -> List[str]:
+    try:
+        ws = gs().worksheet(SHEET_EVENTTYPES)
+        rows = _read_all(ws)
+        titles = []
+        for r in rows:
+            active = str(r.get("active", "")).strip().lower() in ("1", "true", "yes")
+            if not active:
+                continue
+            title = (r.get("title") or r.get("type") or r.get("type_code") or "").strip()
+            if title:
+                titles.append(title)
+        return titles
+    except Exception:
+        return []
+      
 # ============================== Phase 1: Onboarding ===========================
 
 onboarding_router = Router(name="onboarding")
@@ -226,6 +243,22 @@ async def ob_name(message: Message, state: FSMContext):
         "_Напр.: +380671234567_"
     )
     await state.set_state(Onboard.ask_phone)
+async def _send_welcome_with_eventtypes(chat_id: int):
+    titles = _active_eventtypes_titles()
+    if titles:
+        lst = "\n".join([f"• {t}" for t in titles])
+        txt_list = f"📅 *Наші регулярні конференції:*\n{lst}\n\n"
+    else:
+        txt_list = ""
+    friendly = ("🎉 Готово! Ви додані до системи.\n"
+                "Очікуйте запрошення на конференції — вони прийдуть у цей бот найближчим часом.")
+    try:
+        if txt_list:
+            await bot.send_message(chat_id, txt_list)
+        await bot.send_message(chat_id, friendly)
+    except Exception:
+        # м’яко ігноруємо — реєстрація вже пройшла
+        pass
 
 @onboarding_router.message(Onboard.ask_phone)
 async def ob_phone(message: Message, state: FSMContext):
@@ -249,7 +282,7 @@ async def ob_phone(message: Message, state: FSMContext):
             ws.update_cell(rownum, _col_index(ws, "phone"), phone)
             ws.update_cell(rownum, _col_index(ws, "status"), "active")
             ws.update_cell(rownum, _col_index(ws, "last_seen_at"), now_local_str())
-            await message.answer("🎉 Готово! Дані оновлено. Ви будете отримувати запрошення.")
+            await _send_welcome_with_eventtypes(int(message.from_user.id))
             await state.clear()
             return
 
@@ -263,7 +296,7 @@ async def ob_phone(message: Message, state: FSMContext):
                 ws.update_cell(rownum, _col_index(ws, "full_name"), full_name)
                 ws.update_cell(rownum, _col_index(ws, "status"), "active")
                 ws.update_cell(rownum, _col_index(ws, "last_seen_at"), now_local_str())
-                await message.answer("🎉 Готово! Вас підключено до сповіщень.")
+                await _send_welcome_with_eventtypes(int(message.from_user.id))
             else:
                 client_id = f"cl_{message.from_user.id}"
                 _append(ws, {
@@ -281,6 +314,8 @@ async def ob_phone(message: Message, state: FSMContext):
                     "✅ Вас додано як нового клієнта. Якщо це ваш перший старт — усе гаразд.\n"
                     "Якщо ви вже працювали з нами раніше — ми перевіримо дані."
                 )
+                await _send_welcome_with_eventtypes(int(message.from_user.id))
+
                 try:
                     if SUPPORT_CHAT_ID:
                         await message.bot.send_message(
@@ -306,7 +341,7 @@ async def ob_phone(message: Message, state: FSMContext):
                 "last_seen_at": now_local_str(),
                 "program": "",
             })
-            await message.answer("🎉 Готово! Ви додані до системи. Будемо надсилати запрошення на зустрічі.")
+            await _send_welcome_with_eventtypes(int(message.from_user.id))
     except Exception:
         await message.answer("На жаль, не вдалося записати дані. Спробуйте пізніше.")
     finally:
