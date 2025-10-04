@@ -1,4 +1,5 @@
-python-telegram-bot~=22.5
-gspread~=6.2.1
-google-auth~=2.41
+aiogram==3.4.1
+APScheduler==3.10.4
+gspread==6.2.1
+google-auth==2.41.0
 tzdata>=2025.2
