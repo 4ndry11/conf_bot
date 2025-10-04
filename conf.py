@@ -3,7 +3,7 @@ import os
 import re
 import uuid
 import asyncio
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -20,6 +20,8 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 # =============================== CONFIG =======================================
 
@@ -85,7 +87,6 @@ def update_cell(w: gspread.Worksheet, row_idx: int, column_name: str, value: Any
     if column_name not in headers:
         return
     col_idx = headers.index(column_name) + 1
-    # правильный одиночный апдейт ячейки
     w.update_cell(row_idx, col_idx, str(value) if value is not None else "")
 
 def delete_row(w: gspread.Worksheet, row_idx: int) -> None:
@@ -229,7 +230,6 @@ def upsert_client(tg_user_id: int, full_name: str, phone: str, status: str = "ac
     }
     existing_row = find_row_by_value(w, "tg_user_id", tg_user_id)
     if existing_row:
-        # збережемо старий created_at
         old_vals = w.row_values(existing_row)
         headers = ws_headers(w)
         old_map = {headers[i]: old_vals[i] if i < len(old_vals) else "" for i in range(len(headers))}
@@ -414,46 +414,46 @@ def try_get_tg_from_client_id(client_id: str) -> Optional[int]:
 # ============================== KEYBOARDS ======================================
 
 def kb_admin_main() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Додати конференцію", callback_data="admin:add")],
-        [InlineKeyboardButton("📋 Список конференцій", callback_data="admin:list:0")],
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Додати конференцію", callback_data="admin:add")],
+        [InlineKeyboardButton(text="📋 Список конференцій", callback_data="admin:list:0")],
     ])
 
 def kb_rsvp(event_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton("✅ Так, буду", callback_data=f"rsvp:{event_id}:going"),
-            InlineKeyboardButton("🚫 Не зможу", callback_data=f"rsvp:{event_id}:declined"),
+            InlineKeyboardButton(text="✅ Так, буду", callback_data=f"rsvp:{event_id}:going"),
+            InlineKeyboardButton(text="🚫 Не зможу", callback_data=f"rsvp:{event_id}:declined"),
         ],
-        [InlineKeyboardButton("🔔 Нагадати за 24 год", callback_data=f"rsvp:{event_id}:remind")],
+        [InlineKeyboardButton(text="🔔 Нагадати за 24 год", callback_data=f"rsvp:{event_id}:remind")],
     ])
 
 def kb_event_actions(event_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Змінити", callback_data=f"admin:edit:{event_id}")],
-        [InlineKeyboardButton("❌ Скасувати", callback_data=f"admin:cancel:{event_id}")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="admin:list:0")],
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Змінити", callback_data=f"admin:edit:{event_id}")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"admin:cancel:{event_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:list:0")],
     ])
 
 def kb_edit_event_menu(event_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Назва", callback_data=f"admin:edit:{event_id}:field:title")],
-        [InlineKeyboardButton("✏️ Опис", callback_data=f"admin:edit:{event_id}:field:description")],
-        [InlineKeyboardButton("🗓 Дата/час", callback_data=f"admin:edit:{event_id}:field:start_at")],
-        [InlineKeyboardButton("⏱ Тривалість (хв)", callback_data=f"admin:edit:{event_id}:field:duration_min")],
-        [InlineKeyboardButton("🔗 Посилання", callback_data=f"admin:edit:{event_id}:field:link")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:list:0")],
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Назва", callback_data=f"admin:edit:{event_id}:field:title")],
+        [InlineKeyboardButton(text="✏️ Опис", callback_data=f"admin:edit:{event_id}:field:description")],
+        [InlineKeyboardButton(text="🗓 Дата/час", callback_data=f"admin:edit:{event_id}:field:start_at")],
+        [InlineKeyboardButton(text="⏱ Тривалість (хв)", callback_data=f"admin:edit:{event_id}:field:duration_min")],
+        [InlineKeyboardButton(text="🔗 Посилання", callback_data=f"admin:edit:{event_id}:field:link")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:list:0")],
     ])
 
 def kb_cancel_confirm(event_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Так, скасувати", callback_data=f"admin:cancel:{event_id}:yes")],
-        [InlineKeyboardButton("⬅️ Ні, назад", callback_data=f"admin:edit:{event_id}")],
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Так, скасувати", callback_data=f"admin:cancel:{event_id}:yes")],
+        [InlineKeyboardButton(text="⬅️ Ні, назад", callback_data=f"admin:edit:{event_id}")],
     ])
 
 def kb_claim_feedback(event_id: str, client_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛠 Беру в роботу", callback_data=f"claim:{event_id}:{client_id}")],
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛠 Беру в роботу", callback_data=f"claim:{event_id}:{client_id}")],
     ])
 
 # ============================== STATE / MEMORY =================================
@@ -480,7 +480,7 @@ class FeedbackSG(StatesGroup):
 
 # ================================ BOT/DP =======================================
 
-bot = Bot(BOT_TOKEN, parse_mode="Markdown")
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler(timezone=str(TZ))
 
@@ -492,7 +492,6 @@ async def cmd_start(m: Message, state: FSMContext):
     args = (m.text or "").split(maxsplit=1)
     arg = ""
     if len(args) > 1:
-        # /start <payload>
         arg = args[1].strip()
 
     # Адмін-режим
@@ -571,9 +570,9 @@ async def admin_add(q: CallbackQuery, state: FSMContext):
         await q.message.edit_text("Немає активних типів конференцій.", reply_markup=kb_admin_main())
         await q.answer()
         return
-    buttons = [[InlineKeyboardButton(t["title"], callback_data=f"admin:add:type:{t['type_code']}")] for t in types]
-    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:home")])
-    await q.message.edit_text("Оберіть тип конференції:", reply_markup=InlineKeyboardMarkup(buttons))
+    buttons = [[InlineKeyboardButton(text=t["title"], callback_data=f"admin:add:type:{t['type_code']}")] for t in types]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:home")])
+    await q.message.edit_text("Оберіть тип конференції:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await q.answer()
 
 @dp.callback_query(F.data.startswith("admin:add:type:"))
@@ -599,11 +598,11 @@ async def admin_add_select_type(q: CallbackQuery, state: FSMContext):
         f"Базові дані підставлено з довідника:\n"
         f"• Тип: {payload['type_title']}\n• Назва: {payload['title']}\n• Опис: {payload['description']}\n\n"
         f"Можете підправити та натиснути «➡️ Далі».",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Змінити назву", callback_data="admin:add:edit_title")],
-            [InlineKeyboardButton("✏️ Змінити опис", callback_data="admin:add:edit_desc")],
-            [InlineKeyboardButton("➡️ Далі", callback_data="admin:add:next")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="admin:home")],
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Змінити назву", callback_data="admin:add:edit_title")],
+            [InlineKeyboardButton(text="✏️ Змінити опис", callback_data="admin:add:edit_desc")],
+            [InlineKeyboardButton(text="➡️ Далі", callback_data="admin:add:next")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:home")],
         ])
     )
     await q.answer()
@@ -623,10 +622,10 @@ async def admin_add_wait_title(m: Message, state: FSMContext):
     await m.answer(
         f"Назву оновлено.\n\nПоточні дані:\n• Тип: {data['type_title']}\n• Назва: {data['title']}\n• Опис: {data['description']}\n\n"
         f"Натисніть «➡️ Далі» або змініть інше поле.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Змінити назву", callback_data="admin:add:edit_title")],
-            [InlineKeyboardButton("✏️ Змінити опис", callback_data="admin:add:edit_desc")],
-            [InlineKeyboardButton("➡️ Далі", callback_data="admin:add:next")],
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Змінити назву", callback_data="admin:add:edit_title")],
+            [InlineKeyboardButton(text="✏️ Змінити опис", callback_data="admin:add:edit_desc")],
+            [InlineKeyboardButton(text="➡️ Далі", callback_data="admin:add:next")],
         ])
     )
 
@@ -645,10 +644,10 @@ async def admin_add_wait_desc(m: Message, state: FSMContext):
     await m.answer(
         f"Опис оновлено.\n\nПоточні дані:\n• Тип: {data['type_title']}\n• Назва: {data['title']}\n• Опис: {data['description']}\n\n"
         f"Натисніть «➡️ Далі» або змініть інше поле.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Змінити назву", callback_data="admin:add:edit_title")],
-            [InlineKeyboardButton("✏️ Змінити опис", callback_data="admin:add:edit_desc")],
-            [InlineKeyboardButton("➡️ Далі", callback_data="admin:add:next")],
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Змінити назву", callback_data="admin:add:edit_title")],
+            [InlineKeyboardButton(text="✏️ Змінити опис", callback_data="admin:add:edit_desc")],
+            [InlineKeyboardButton(text="➡️ Далі", callback_data="admin:add:next")],
         ])
     )
 
@@ -732,16 +731,16 @@ async def admin_list(q: CallbackQuery):
     for e in subset:
         dt = event_start_dt(e)
         dt_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "—"
-        buttons.append([InlineKeyboardButton(f"{e['title']} — {dt_str}", callback_data=f"admin:event:{e['event_id']}")])
+        buttons.append([InlineKeyboardButton(text=f"{e['title']} — {dt_str}", callback_data=f"admin:event:{e['event_id']}")])
     nav = []
     if start > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"admin:list:{page-1}"))
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin:list:{page-1}"))
     if end < total:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"admin:list:{page+1}"))
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin:list:{page+1}"))
     if nav:
         buttons.append(nav)
-    buttons.append([InlineKeyboardButton("🏠 Головне меню", callback_data="admin:home")])
-    await q.message.edit_text(f"Список конференцій (усього: {total}):", reply_markup=InlineKeyboardMarkup(buttons))
+    buttons.append([InlineKeyboardButton(text="🏠 Головне меню", callback_data="admin:home")])
+    await q.message.edit_text(f"Список конференцій (усього: {total}):", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await q.answer()
 
 @dp.callback_query(F.data.startswith("admin:event:"))
@@ -773,12 +772,10 @@ async def admin_edit(q: CallbackQuery, state: FSMContext):
         return
     parts = q.data.split(":")
     if len(parts) == 3:
-        # admin:edit:<event_id>
         event_id = parts[-1]
         await q.message.edit_text("Оберіть поле для редагування:", reply_markup=kb_edit_event_menu(event_id))
         await q.answer()
         return
-    # admin:edit:<event_id>:field:<field>
     if len(parts) == 5 and parts[3] == "field":
         event_id = parts[2]
         field = parts[4]
@@ -854,7 +851,6 @@ async def admin_cancel(q: CallbackQuery):
 @dp.callback_query(F.data.startswith("rsvp:"))
 async def cb_rsvp(q: CallbackQuery):
     parts = q.data.split(":")
-    # rsvp:<event_id>:<action>
     if len(parts) != 3:
         await q.answer()
         return
@@ -886,8 +882,8 @@ async def cb_rsvp(q: CallbackQuery):
         if not alt:
             await q.message.edit_text("Добре! Тоді очікуйте нове запрошення на іншу дату.")
         else:
-            btns = [[InlineKeyboardButton(f"{a['title']} — {a['start_at']}", callback_data="noop")] for a in alt]
-            await q.message.edit_text("Можливі альтернативи:", reply_markup=InlineKeyboardMarkup(btns))
+            btns = [[InlineKeyboardButton(text=f"{a['title']} — {a['start_at']}", callback_data="noop")] for a in alt]
+            await q.message.edit_text("Можливі альтернативи:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
         await q.answer()
         return
 
@@ -900,7 +896,6 @@ async def cb_rsvp(q: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("claim:"))
 async def claim_feedback(q: CallbackQuery):
-    # claim:<event_id>:<client_id>
     parts = q.data.split(":")
     if len(parts) != 3:
         await q.answer()
@@ -941,7 +936,6 @@ async def route_low_feedback(event_id: str, client_id: str, stars: int, comment:
 @dp.callback_query(F.data.startswith("fb:"))
 async def fb_callbacks(q: CallbackQuery, state: FSMContext):
     data = q.data or ""
-    # fb:<event_id>:<client_id>:<stars>
     if data.startswith("fb:") and data.count(":") == 3:
         _, event_id, client_id, stars = data.split(":")
         stars = int(stars)
@@ -951,7 +945,6 @@ async def fb_callbacks(q: CallbackQuery, state: FSMContext):
             await route_low_feedback(event_id, client_id, stars, "")
         await q.answer()
         return
-    # fb:comment:<event_id>:<client_id>
     if data.startswith("fb:comment:"):
         _, _, event_id, client_id = data.split(":")
         tg_id = try_get_tg_from_client_id(client_id)
@@ -968,11 +961,9 @@ async def fb_callbacks(q: CallbackQuery, state: FSMContext):
 async def fb_wait_comment(m: Message, state: FSMContext):
     data = await state.get_data()
     comment = (m.text or "").strip()
-    # Якщо оцінка не складалась — збережемо як коментар з оцінкою 0
     feedback_save(data["event_id"], data["client_id"], 0, comment)
     await m.answer("Дякуємо! Відгук збережено.")
     await state.clear()
-    # 0 < 4 -> маршрутизувати як скаргу
     await route_low_feedback(data["event_id"], data["client_id"], 0, comment)
 
 # =============================== NOTIFY HELPERS ================================
@@ -1011,13 +1002,12 @@ async def notify_event_cancel(event_id: str):
 
 async def scheduler_tick():
     now = now_kyiv()
-    # 1) INVITES (-24h) -> активним, хто ще не був на цьому типі
     for e in list_future_events_sorted():
         dt = event_start_dt(e)
         if not dt:
             continue
         diff = (dt - now).total_seconds()
-        # Вікно для інвайтів (~24h)
+
         if 24*3600 - 60 <= diff <= 24*3600 + 60:
             type_code = a2i(e.get("type"))
             for cli in list_active_clients():
@@ -1045,7 +1035,6 @@ async def scheduler_tick():
                 except Exception:
                     pass
 
-        # 2) REMINDER -24h (going or remind_24h, not reminded_24h)
         if 24*3600 - 60 <= diff <= 24*3600 + 60:
             for r in rsvp_get_for_event(e["event_id"]):
                 cid = r.get("client_id")
@@ -1063,7 +1052,6 @@ async def scheduler_tick():
                     except Exception:
                         pass
 
-        # 3) REMINDER -60m (going, not reminded_60m)
         if 60*60 - 60 <= diff <= 60*60 + 60:
             for r in rsvp_get_for_event(e["event_id"]):
                 cid = r.get("client_id")
@@ -1081,7 +1069,6 @@ async def scheduler_tick():
                     except Exception:
                         pass
 
-        # 4) FEEDBACK +3h (attended=1), лише раз на подію
         if -60 <= (now - dt - timedelta(hours=3)).total_seconds() <= 60:
             if has_log("feedback_requested", client_id="", event_id=e["event_id"]):
                 continue
@@ -1094,15 +1081,15 @@ async def scheduler_tick():
                     if not tg_id:
                         continue
                     text = messages_get("feedback.ask").format(title=e["title"])
-                    kb = InlineKeyboardMarkup([
+                    kb = InlineKeyboardMarkup(inline_keyboard=[
                         [
-                            InlineKeyboardButton("⭐️1", callback_data=f"fb:{e['event_id']}:{cid}:1"),
-                            InlineKeyboardButton("⭐️2", callback_data=f"fb:{e['event_id']}:{cid}:2"),
-                            InlineKeyboardButton("⭐️3", callback_data=f"fb:{e['event_id']}:{cid}:3"),
-                            InlineKeyboardButton("⭐️4", callback_data=f"fb:{e['event_id']}:{cid}:4"),
-                            InlineKeyboardButton("⭐️5", callback_data=f"fb:{e['event_id']}:{cid}:5"),
+                            InlineKeyboardButton(text="⭐️1", callback_data=f"fb:{e['event_id']}:{cid}:1"),
+                            InlineKeyboardButton(text="⭐️2", callback_data=f"fb:{e['event_id']}:{cid}:2"),
+                            InlineKeyboardButton(text="⭐️3", callback_data=f"fb:{e['event_id']}:{cid}:3"),
+                            InlineKeyboardButton(text="⭐️4", callback_data=f"fb:{e['event_id']}:{cid}:4"),
+                            InlineKeyboardButton(text="⭐️5", callback_data=f"fb:{e['event_id']}:{cid}:5"),
                         ],
-                        [InlineKeyboardButton("✍️ Написати відгук", callback_data=f"fb:comment:{e['event_id']}:{cid}")]
+                        [InlineKeyboardButton(text="✍️ Написати відгук", callback_data=f"fb:comment:{e['event_id']}:{cid}")]
                     ])
                     try:
                         await bot.send_message(chat_id=int(tg_id), text=text, reply_markup=kb)
@@ -1113,11 +1100,12 @@ async def scheduler_tick():
 # ================================ STARTUP ======================================
 
 async def on_startup():
-    # Планувальник: кожні 60с
     scheduler.add_job(scheduler_tick, "interval", seconds=60, id="tick", replace_existing=True)
     scheduler.start()
 
 async def main():
+    # на всякий случай: снимаем webhook, чтобы не было конфликта с polling
+    await bot.delete_webhook(drop_pending_updates=True)
     await on_startup()
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
