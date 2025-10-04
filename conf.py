@@ -1006,36 +1006,52 @@ async def scheduler_tick():
         dt = event_start_dt(e)
         if not dt:
             continue
+
+        # Скільки залишилось до старту (в секундах)
         diff = (dt - now).total_seconds()
 
-        if 24*3600 - 60 <= diff <= 24*3600 + 60:
+        # ================== 1) ІНВАЙТ за ~10 хв до початку ==================
+        # (було: 24*3600 ± 60)
+        if 10*60 - 60 <= diff <= 10*60 + 60:
             type_code = a2i(e.get("type"))
             for cli in list_active_clients():
                 cid = cli.get("client_id")
                 tg_id = cli.get("tg_user_id")
                 if not cid or not tg_id:
                     continue
+                # не шлем тим, хто вже був на цьому типі
                 if client_has_attended_type(cid, type_code):
                     continue
+                # не дублюємо інвайт по тому ж event_id
                 if has_log("invite_sent", cid, e["event_id"]):
                     continue
-                title = e["title"]; descr = e["description"]
+
+                title = e["title"]
+                descr = e["description"]
                 body = messages_get("invite.body").format(
-                    name=cli.get("full_name","Клієнт"),
+                    name=cli.get("full_name", "Клієнт"),
                     title=title,
                     date=fmt_date(dt),
                     time=fmt_time(dt),
                     description=descr
                 )
                 try:
-                    await bot.send_message(chat_id=int(tg_id),
-                                           text=messages_get("invite.title").format(title=title))
-                    await bot.send_message(chat_id=int(tg_id), text=body, reply_markup=kb_rsvp(e["event_id"]))
+                    await bot.send_message(
+                        chat_id=int(tg_id),
+                        text=messages_get("invite.title").format(title=title)
+                    )
+                    await bot.send_message(
+                        chat_id=int(tg_id),
+                        text=body,
+                        reply_markup=kb_rsvp(e["event_id"])
+                    )
                     log_action("invite_sent", client_id=cid, event_id=e["event_id"], details="")
                 except Exception:
                     pass
 
-        if 24*3600 - 60 <= diff <= 24*3600 + 60:
+        # ============= 2) НАГАДУВАННЯ за ~10 хв (going / remind_24h) =============
+        # (було: 24*3600 ± 60)
+        if 10*60 - 60 <= diff <= 10*60 + 60:
             for r in rsvp_get_for_event(e["event_id"]):
                 cid = r.get("client_id")
                 tg_id = try_get_tg_from_client_id(cid)
@@ -1044,7 +1060,9 @@ async def scheduler_tick():
                 if a2i(r.get("reminded_24h"), 0) == 1:
                     continue
                 if str(r.get("rsvp")) in {"going", "remind_24h"}:
-                    body = messages_get("reminder.24h").format(title=e["title"], time=fmt_time(dt), link=e["link"])
+                    body = messages_get("reminder.24h").format(
+                        title=e["title"], time=fmt_time(dt), link=e["link"]
+                    )
                     try:
                         await bot.send_message(chat_id=int(tg_id), text=body)
                         rsvp_upsert(e["event_id"], cid, reminded_24h=1)
@@ -1052,7 +1070,9 @@ async def scheduler_tick():
                     except Exception:
                         pass
 
-        if 60*60 - 60 <= diff <= 60*60 + 60:
+        # ============= 3) НАГАДУВАННЯ за ~5 хв (тільки going) ====================
+        # (було: 60*60 ± 60)
+        if 5*60 - 60 <= diff <= 5*60 + 60:
             for r in rsvp_get_for_event(e["event_id"]):
                 cid = r.get("client_id")
                 tg_id = try_get_tg_from_client_id(cid)
@@ -1069,9 +1089,14 @@ async def scheduler_tick():
                     except Exception:
                         pass
 
-        if -60 <= (now - dt - timedelta(hours=3)).total_seconds() <= 60:
+        # ============= 4) ФІДБЕК через ~5 хв ПІСЛЯ ЗАВЕРШЕННЯ ====================
+        # (було: start_at + 3 години; стало: (start_at + duration_min) + 5 хв)
+        end_dt = dt + timedelta(minutes=a2i(e.get("duration_min")))
+        if -60 <= (now - end_dt - timedelta(minutes=5)).total_seconds() <= 60:
+            # щоб відправити лише один раз на подію
             if has_log("feedback_requested", client_id="", event_id=e["event_id"]):
                 continue
+
             w_att = ws(SHEET_ATTEND)
             rows_att = get_all_records(w_att)
             for r in rows_att:
@@ -1095,7 +1120,9 @@ async def scheduler_tick():
                         await bot.send_message(chat_id=int(tg_id), text=text, reply_markup=kb)
                     except Exception:
                         pass
+
             log_action("feedback_requested", client_id="", event_id=e["event_id"], details="")
+
 
 # ================================ STARTUP ======================================
 
