@@ -1006,6 +1006,23 @@ async def route_low_feedback(event_id: str, client_id: str, stars: int, comment:
     except Exception:
         pass
 
+async def route_low_feedback_comment_update(event_id: str, client_id: str, comment: str):
+    # короткая “добавка” к уже отправленной скарге
+    cli_tg = try_get_tg_from_client_id(client_id)
+    event = get_event_by_id(event_id) or {}
+    text = (
+        f"📝 Доповнення до скарги\n"
+        f"• Подія: {event.get('title','')}\n"
+        f"• Клієнт: {client_id} (tg_id={cli_tg})\n"
+        f"• Коментар: {comment or '—'}"
+    )
+    try:
+        await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text)
+        log_action("low_fb_comment_update_sent", client_id=client_id, event_id=event_id, details="")
+    except Exception as e:
+        log_action("support_send_error", client_id=client_id, event_id=event_id, details=f"{e!r}")
+
+
 @dp.callback_query(F.data.startswith("fb:"))
 async def fb_callbacks(q: CallbackQuery, state: FSMContext):
     data = q.data or ""
@@ -1014,12 +1031,20 @@ async def fb_callbacks(q: CallbackQuery, state: FSMContext):
     if data.startswith("fb:") and data.count(":") == 3 and not data.startswith("fb:comment:") and not data.startswith("fb:skip:"):
         _, event_id, client_id, stars = data.split(":")
         stars = int(stars)
-
-        # фиксируем/обновляем оценку (комментарий пока пустой)
+    
+        # 1) сохраняем оценку
         feedback_upsert(event_id, client_id, stars=stars)
-
-        # Предлагаем написать комментарий или пропустить
-        prompt = f"Дякуємо! Оцінка {stars}⭐️ збережена.\nБажаєте додати короткий коментар?"
+    
+        # 2) СРАЗУ пингуем саппорт, если <4
+        if stars < 4:
+            try:
+                await route_low_feedback(event_id, client_id, stars, "")
+                log_action("low_fb_alert_sent", client_id=client_id, event_id=event_id, details=f"stars={stars}")
+            except Exception as e:
+                log_action("support_send_error", client_id=client_id, event_id=event_id, details=f"{e!r}")
+    
+        # 3) предлагаем комментарий или пропустить
+        prompt = f"Дякуємо! Оцінка {stars}⭐️ збережена.\нБажаєте додати короткий коментар?"
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✍️ Написати коментар", callback_data=f"fb:comment:{event_id}:{client_id}")],
             [InlineKeyboardButton(text="⏭ Пропустити", callback_data=f"fb:skip:{event_id}:{client_id}")]
@@ -1028,20 +1053,14 @@ async def fb_callbacks(q: CallbackQuery, state: FSMContext):
         await q.answer()
         return
 
+
     # Нажали «Пропустити»: fb:skip:<event_id>:<client_id>
     if data.startswith("fb:skip:"):
         _, _, event_id, client_id = data.split(":")
-        row = feedback_get(event_id, client_id) or {}
-        stars = a2i(row.get("stars"), 0)
-        comment = (row.get("comment") or "").strip()
-
         await q.message.edit_text("Дякуємо за ваш відгук! ✅")
         await q.answer()
-
-        # якщо низька оцінка — маршрутизуємо в саппорт (з коментарем, якщо він є)
-        if stars and stars < 4:
-            await route_low_feedback(event_id, client_id, stars, comment)
         return
+
 
     # Запросили ввод комментария: fb:comment:<event_id>:<client_id>
     if data.startswith("fb:comment:"):
@@ -1068,16 +1087,16 @@ async def fb_wait_comment(m: Message, state: FSMContext):
     if comment == "-":
         comment = ""
 
-    # дописываем коммент в ту же запись
     saved = feedback_upsert(event_id, client_id, comment=comment)
     stars = a2i(saved.get("stars"), 0)
 
     await m.answer("Дякуємо! Відгук збережено. ✅")
     await state.clear()
 
-    # якщо низька оцінка — маршрутизуємо після завершення флоу
-    if stars and stars < 4:
-        await route_low_feedback(event_id, client_id, stars, comment)
+    # если оценка была низкой — досылаем апдейт коммента
+    if stars and stars < 4 and comment:
+        await route_low_feedback_comment_update(event_id, client_id, comment)
+
 
 
 # =============================== NOTIFY HELPERS ================================
