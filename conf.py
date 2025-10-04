@@ -85,8 +85,8 @@ def update_cell(w: gspread.Worksheet, row_idx: int, column_name: str, value: Any
     if column_name not in headers:
         return
     col_idx = headers.index(column_name) + 1
-    a1 = rowcol_to_a1(row_idx, col_idx)
-    w.update(a1, str(value) if value is not None else "", value_input_option="USER_ENTERED")
+    # правильный одиночный апдейт ячейки
+    w.update_cell(row_idx, col_idx, str(value) if value is not None else "")
 
 def delete_row(w: gspread.Worksheet, row_idx: int) -> None:
     w.delete_rows(row_idx)
