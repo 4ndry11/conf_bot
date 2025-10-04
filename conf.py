@@ -408,18 +408,42 @@ def rsvp_get_for_event(event_id: str) -> List[Dict[str, Any]]:
     w = ws(SHEET_RSVP)
     return [r for r in get_all_records(w) if str(r.get("event_id")) == event_id]
 
-def feedback_save(event_id: str, client_id: str, stars: int, comment: str = "") -> None:
+def feedback_get(event_id: str, client_id: str) -> Optional[Dict[str, Any]]:
     w = ws(SHEET_FEEDBACK)
+    rows = get_all_records(w)
+    for r in rows:
+        if str(r.get("event_id")) == event_id and str(r.get("client_id")) == client_id:
+            return r
+    return None
+
+
+def feedback_upsert(event_id: str, client_id: str, stars: Optional[int] = None, comment: Optional[str] = None) -> Dict[str, Any]:
+    """Создаёт или обновляет запись фидбэка для пары (event_id, client_id)."""
+    w = ws(SHEET_FEEDBACK)
+    rows = get_all_records(w)
+    row_idx = None
+    current = {}
+    for i, r in enumerate(rows, start=2):
+        if str(r.get("event_id")) == event_id and str(r.get("client_id")) == client_id:
+            row_idx = i
+            current = r
+            break
+
     payload = {
         "event_id": event_id,
         "client_id": client_id,
-        "stars": int(stars),
-        "comment": comment or "",
-        "owner": "",
+        "stars": int(stars) if stars is not None else a2i(current.get("stars"), 0),
+        "comment": (comment if comment is not None else current.get("comment", "")) or "",
+        "owner": current.get("owner", ""),
     }
-    append_dict(w, payload)
-    if stars < 4:
-        log_action("feedback_low_routed", client_id=client_id, event_id=event_id, details=f"stars={stars}")
+
+    if row_idx:
+        update_row_dict(w, row_idx, payload)
+    else:
+        append_dict(w, payload)
+
+    return payload
+
 
 def feedback_assign_owner(event_id: str, client_id: str, owner: str) -> None:
     w = ws(SHEET_FEEDBACK)
@@ -820,17 +844,29 @@ async def admin_edit(q: CallbackQuery, state: FSMContext):
         await q.answer()
 
 @dp.message(AdminEditFieldSG.wait_value)
+@dp.message(AdminEditFieldSG.wait_value)
 async def admin_edit_field_value(m: Message, state: FSMContext):
     data = await state.get_data()
     event_id = data.get("event_id")
     field = data.get("field")
+
+    # text-поля
     if field in {"title", "description", "link"}:
         val = (m.text or "").strip()
         update_event_field(event_id, field, val)
         await m.answer("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
         await state.clear()
-        await notify_event_update(event_id, f"Змінено поле: {field}")
+
+        # подробные уведомления по каждому полю
+        if field == "title":
+            await notify_event_update(event_id, f"Оновлено назву: {val}")
+        elif field == "description":
+            await notify_event_update(event_id, "Оновлено опис.")
+        elif field == "link":
+            await notify_event_update(event_id, f"Оновлено посилання: {val}")
         return
+
+    # дата/час
     if field == "start_at":
         dt = parse_dt(m.text or "")
         if not dt:
@@ -839,8 +875,11 @@ async def admin_edit_field_value(m: Message, state: FSMContext):
         update_event_field(event_id, "start_at", iso_dt(dt))
         await m.answer("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
         await state.clear()
-        await notify_event_update(event_id, "Змінено дату/час")
+        # <-- ключ: в уведомлении шлём новое время
+        await notify_event_update(event_id, f"Змінено дату/час: {fmt_date(dt)} о {fmt_time(dt)} (Київ)")
         return
+
+    # тривалість
     if field == "duration_min":
         try:
             dur = int((m.text or "").strip())
@@ -852,8 +891,9 @@ async def admin_edit_field_value(m: Message, state: FSMContext):
         update_event_field(event_id, "duration_min", dur)
         await m.answer("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
         await state.clear()
-        await notify_event_update(event_id, "Змінено тривалість")
+        await notify_event_update(event_id, f"Змінено тривалість: {dur} хв")
         return
+
 
 @dp.callback_query(F.data.startswith("admin:cancel:"))
 async def admin_cancel(q: CallbackQuery):
@@ -969,15 +1009,41 @@ async def route_low_feedback(event_id: str, client_id: str, stars: int, comment:
 @dp.callback_query(F.data.startswith("fb:"))
 async def fb_callbacks(q: CallbackQuery, state: FSMContext):
     data = q.data or ""
-    if data.startswith("fb:") and data.count(":") == 3:
+
+    # Выбор звёзд: fb:<event_id>:<client_id>:<stars>
+    if data.startswith("fb:") and data.count(":") == 3 and not data.startswith("fb:comment:") and not data.startswith("fb:skip:"):
         _, event_id, client_id, stars = data.split(":")
         stars = int(stars)
-        feedback_save(event_id, client_id, stars, "")
-        await q.message.edit_text(f"Дякуємо! Оцінка {stars}⭐️ збережена.")
-        if stars < 4:
-            await route_low_feedback(event_id, client_id, stars, "")
+
+        # фиксируем/обновляем оценку (комментарий пока пустой)
+        feedback_upsert(event_id, client_id, stars=stars)
+
+        # Предлагаем написать комментарий или пропустить
+        prompt = f"Дякуємо! Оцінка {stars}⭐️ збережена.\nБажаєте додати короткий коментар?"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✍️ Написати коментар", callback_data=f"fb:comment:{event_id}:{client_id}")],
+            [InlineKeyboardButton(text="⏭ Пропустити", callback_data=f"fb:skip:{event_id}:{client_id}")]
+        ])
+        await q.message.edit_text(prompt, reply_markup=kb)
         await q.answer()
         return
+
+    # Нажали «Пропустити»: fb:skip:<event_id>:<client_id>
+    if data.startswith("fb:skip:"):
+        _, _, event_id, client_id = data.split(":")
+        row = feedback_get(event_id, client_id) or {}
+        stars = a2i(row.get("stars"), 0)
+        comment = (row.get("comment") or "").strip()
+
+        await q.message.edit_text("Дякуємо за ваш відгук! ✅")
+        await q.answer()
+
+        # якщо низька оцінка — маршрутизуємо в саппорт (з коментарем, якщо він є)
+        if stars and stars < 4:
+            await route_low_feedback(event_id, client_id, stars, comment)
+        return
+
+    # Запросили ввод комментария: fb:comment:<event_id>:<client_id>
     if data.startswith("fb:comment:"):
         _, _, event_id, client_id = data.split(":")
         tg_id = try_get_tg_from_client_id(client_id)
@@ -987,17 +1053,32 @@ async def fb_callbacks(q: CallbackQuery, state: FSMContext):
             return
         await state.set_state(FeedbackSG.wait_comment)
         await state.update_data(event_id=event_id, client_id=client_id)
-        await q.message.edit_text("Надішліть, будь ласка, текстовий відгук повідомленням.")
+        await q.message.edit_text("Надішліть, будь ласка, текстовий коментар одним повідомленням.\nАбо надішліть «-», щоб пропустити.")
         await q.answer()
+        return
+
 
 @dp.message(FeedbackSG.wait_comment)
 async def fb_wait_comment(m: Message, state: FSMContext):
     data = await state.get_data()
+    event_id = data["event_id"]
+    client_id = data["client_id"]
+
     comment = (m.text or "").strip()
-    feedback_save(data["event_id"], data["client_id"], 0, comment)
-    await m.answer("Дякуємо! Відгук збережено.")
+    if comment == "-":
+        comment = ""
+
+    # дописываем коммент в ту же запись
+    saved = feedback_upsert(event_id, client_id, comment=comment)
+    stars = a2i(saved.get("stars"), 0)
+
+    await m.answer("Дякуємо! Відгук збережено. ✅")
     await state.clear()
-    await route_low_feedback(data["event_id"], data["client_id"], 0, comment)
+
+    # якщо низька оцінка — маршрутизуємо після завершення флоу
+    if stars and stars < 4:
+        await route_low_feedback(event_id, client_id, stars, comment)
+
 
 # =============================== NOTIFY HELPERS ================================
 
@@ -1124,12 +1205,12 @@ async def scheduler_tick():
 
         # ============= 4) ФІДБЕК через ~5 хв ПІСЛЯ ЗАВЕРШЕННЯ ====================
         # (було: start_at + 3 години; стало: (start_at + duration_min) + 5 хв)
+        # 4) FEEDBACK ...
         end_dt = dt + timedelta(minutes=a2i(e.get("duration_min")))
-        if -60 <= (now - end_dt - timedelta(minutes=5)).total_seconds() <= 60:
-            # щоб відправити лише один раз на подію
+        if -60 <= (now - end_dt - timedelta(minutes=5)).total_seconds() <= 60:  # или твои боевые окна
             if has_log("feedback_requested", client_id="", event_id=e["event_id"]):
                 continue
-
+        
             w_att = ws(SHEET_ATTEND)
             rows_att = get_all_records(w_att)
             for r in rows_att:
@@ -1138,6 +1219,7 @@ async def scheduler_tick():
                     tg_id = try_get_tg_from_client_id(cid)
                     if not tg_id:
                         continue
+        
                     text = messages_get("feedback.ask").format(title=e["title"])
                     kb = InlineKeyboardMarkup(inline_keyboard=[
                         [
@@ -1146,15 +1228,15 @@ async def scheduler_tick():
                             InlineKeyboardButton(text="⭐️3", callback_data=f"fb:{e['event_id']}:{cid}:3"),
                             InlineKeyboardButton(text="⭐️4", callback_data=f"fb:{e['event_id']}:{cid}:4"),
                             InlineKeyboardButton(text="⭐️5", callback_data=f"fb:{e['event_id']}:{cid}:5"),
-                        ],
-                        [InlineKeyboardButton(text="✍️ Написати відгук", callback_data=f"fb:comment:{e['event_id']}:{cid}")]
+                        ]
                     ])
                     try:
                         await bot.send_message(chat_id=int(tg_id), text=text, reply_markup=kb)
                     except Exception:
                         pass
-
+        
             log_action("feedback_requested", client_id="", event_id=e["event_id"], details="")
+
 
 
 # ================================ STARTUP ======================================
