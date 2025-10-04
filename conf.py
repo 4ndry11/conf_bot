@@ -1,1435 +1,1103 @@
 # -*- coding: utf-8 -*-
-# ========================= APP: Bot for conference invites ====================
-# Фази 0..5 об'єднані в один файл для простоти деплою на Render.
-# Потрібні env:
-# BOT_TOKEN, ADMIN_IDS, ADMIN_DEEPLINK_TOKEN, SPREADSHEET_ID,
-# GOOGLE_SA_PATH (/etc/secrets/gsheets.json) або GOOGLE_SA_JSON,
-# SUPPORT_CHAT_ID, TIMEZONE=Europe/Kyiv (за замовчуванням),
-# SECRET_HMAC_KEY (будь-який довгий випадковий рядок),
-# INVITE_QUIET_HOURS (опц., напр. "22-08")
-# ==============================================================================
 
 import os
-import json
 import re
 import uuid
+import json
 import asyncio
-from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
-from urllib.parse import unquote
+from zoneinfo import ZoneInfo
 
 import gspread
-import pytz
-from google.oauth2.service_account import Credentials
-from dateutil import parser as dateparser
+from gspread.utils import rowcol_to_a1
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity
+)
+from telegram.ext import (
+    ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, JobQueue
+)
 
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import CommandStart, Command
-from aiogram.types import (Message, CallbackQuery,
-                           InlineKeyboardMarkup, InlineKeyboardButton)
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+# =============================== CONFIG ======================================
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required")
 
-# ============================== ENV & Global =================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x]
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
+SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", "-1003053461710"))
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "f7T9vQ1111wLp2Gx8Z")
+SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "Conference ZVILNYMO")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
-ADMIN_DEEPLINK_TOKEN = os.getenv("ADMIN_DEEPLINK_TOKEN", "changeme_admin_token")
-SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", "0") or "0")
-SECRET_HMAC_KEY = os.getenv("SECRET_HMAC_KEY", "replace_with_strong_random_string")
+GOOGLE_SA_PATH = os.getenv("GOOGLE_SA_PATH", "/etc/secrets/gsheets.json")
 
-tz = pytz.timezone(TIMEZONE)
+TZ = ZoneInfo(TIMEZONE)
 
-# Бот для всіх роутерів
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
-dp = Dispatcher()
+# =========================== SHEETS CONNECTION ================================
 
-# Назви листів
+def _open_gsheet() -> gspread.Spreadsheet:
+    if not os.path.exists(GOOGLE_SA_PATH):
+        raise RuntimeError(f"Google SA file not found: {GOOGLE_SA_PATH}")
+    sa = gspread.service_account(filename=GOOGLE_SA_PATH)
+    return sa.open(SPREADSHEET_NAME)
+
+GS = _open_gsheet()
+
+def ws(name: str) -> gspread.Worksheet:
+    return GS.worksheet(name)
+
+def ws_headers(w: gspread.Worksheet) -> List[str]:
+    row = w.row_values(1)
+    return [h.strip() for h in row]
+
+def get_all_records(w: gspread.Worksheet) -> List[Dict[str, Any]]:
+    return w.get_all_records(expected_headers=ws_headers(w), default_blank="")
+
+def find_row_by_value(w: gspread.Worksheet, column_name: str, value: Any) -> Optional[int]:
+    headers = ws_headers(w)
+    if column_name not in headers:
+        return None
+    col_idx = headers.index(column_name) + 1
+    col_vals = w.col_values(col_idx)
+    for i, v in enumerate(col_vals, start=1):
+        if i == 1:
+            continue
+        if str(v).strip() == str(value).strip():
+            return i
+    return None
+
+def append_dict(w: gspread.Worksheet, data: Dict[str, Any]) -> None:
+    headers = ws_headers(w)
+    row = [str(data.get(h, "")) if data.get(h, "") is not None else "" for h in headers]
+    w.append_row(row, value_input_option="USER_ENTERED")
+
+def update_row_dict(w: gspread.Worksheet, row_idx: int, data: Dict[str, Any]) -> None:
+    headers = ws_headers(w)
+    row = [str(data.get(h, "")) if data.get(h, "") is not None else "" for h in headers]
+    rng = f"A{row_idx}:{rowcol_to_a1(1, len(headers))[:-1]}{row_idx}"
+    w.update(rng, [row], value_input_option="USER_ENTERED")
+
+def update_cell(w: gspread.Worksheet, row_idx: int, column_name: str, value: Any) -> None:
+    headers = ws_headers(w)
+    if column_name not in headers:
+        return
+    col_idx = headers.index(column_name) + 1
+    a1 = f"{rowcol_to_a1(row_idx, col_idx)}"
+    w.update(a1, str(value) if value is not None else "", value_input_option="USER_ENTERED")
+
+def delete_row(w: gspread.Worksheet, row_idx: int) -> None:
+    w.delete_rows(row_idx)
+
+# =============================== HELPERS ======================================
+
+def now_kyiv() -> datetime:
+    return datetime.now(TZ)
+
+def iso_dt(dt: Optional[datetime] = None) -> str:
+    dt = dt or now_kyiv()
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+def parse_dt(s: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(s.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    except Exception:
+        return None
+
+def fmt_date(dt: datetime) -> str:
+    return dt.strftime("%d.%m.%Y")
+
+def fmt_time(dt: datetime) -> str:
+    return dt.strftime("%H:%M")
+
+def short_uuid(n: int = 8) -> str:
+    return uuid.uuid4().hex[:n]
+
+PHONE_RE = re.compile(r"^(?:\+?38)?0?\d{9}$|^380\d{9}$")
+
+def normalize_phone(raw: str) -> Optional[str]:
+    digits = re.sub(r"\D", "", raw or "")
+    if digits.startswith("380") and len(digits) == 12:
+        return digits
+    if digits.startswith("0") and len(digits) == 10:
+        return "38" + digits
+    if len(digits) == 9:
+        return "380" + digits
+    return None
+
+def a2i(v: Any, default: int = 0) -> int:
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+# =========================== DOMAIN READ/WRITE ================================
+
+# Sheets names (fixed by spec)
+SHEET_EVENTTYPES = "EventTypes"
 SHEET_CLIENTS    = "Clients"
 SHEET_EVENTS     = "Events"
-SHEET_EVENTTYPES = "EventTypes"
-SHEET_RSVP       = "RSVP"
-SHEET_ATTENDANCE = "Attendance"
+SHEET_ATTEND     = "Attendance"
+SHEET_LOG        = "DeliveryLog"
 SHEET_FEEDBACK   = "Feedback"
-SHEET_DELIVERY   = "DeliveryLog"
-SHEET_MESSAGES   = "Messages"
+SHEET_MSG        = "Messages"
+SHEET_RSVP       = "RSVP"
 
-# ============================== Phase 0: Sheets ===============================
-
-async def tell_admins(text: str) -> None:
-    if not ADMIN_IDS:
-        return
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, f"🛠 {text}")
-        except Exception:
-            pass
-
-def _get_gspread_client():
-    sa_json = (os.getenv("GOOGLE_SA_JSON") or "").strip()
-    sa_path = (os.getenv("GOOGLE_SA_PATH") or "/etc/secrets/gsheets.json").strip()
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    if sa_json:
-        data = json.loads(sa_json)
-        creds = Credentials.from_service_account_info(data, scopes=scopes)
-    else:
-        if not os.path.exists(sa_path):
-            raise RuntimeError(f"Service account file not found at {sa_path}")
-        creds = Credentials.from_service_account_file(sa_path, scopes=scopes)
-    return gspread.authorize(creds)
-
-_gc = None
-def gs():
-    global _gc
-    if not SPREADSHEET_ID:
-        raise RuntimeError("SPREADSHEET_ID is not set")
-    if _gc is None:
-        _gc = _get_gspread_client()
-    return _gc.open_by_key(SPREADSHEET_ID)
-
-def _headers(ws) -> List[str]:
-    return [h.strip() for h in ws.row_values(1)]
-
-def _col_index(ws, col_name: str) -> int:
-    return _headers(ws).index(col_name) + 1
-
-def _read_all(ws) -> List[Dict[str, str]]:
-    return ws.get_all_records(numeric_value=False)
-
-def _append(ws, row_dict: Dict[str, str]):
-    hdr = _headers(ws)
-    ws.append_row([row_dict.get(h, "") for h in hdr], value_input_option="USER_ENTERED")
-
-def _find_rows(ws, predicate) -> List[Tuple[int, Dict[str, str]]]:
-    hdr = _headers(ws)
-    values = ws.get_all_values()
-    out: List[Tuple[int, Dict[str, str]]] = []
-    for i in range(1, len(values)):
-        d = {hdr[j]: values[i][j] if j < len(values[i]) else "" for j in range(len(hdr))}
-        if predicate(d):
-            out.append((i + 1, d))
-    return out
-
-def _update_row_by_key(ws, key_col: str, key_val: str, patch: Dict[str, str]) -> bool:
-    vals = ws.get_all_values()
-    if not vals:
-        return False
-    col_map = {name: i for i, name in enumerate(vals[0])}
-    if key_col not in col_map:
-        return False
-    for idx in range(1, len(vals)):
-        row = vals[idx]
-        if row[col_map[key_col]] == key_val:
-            for k, v in patch.items():
-                if k in col_map:
-                    ws.update_cell(idx + 1, col_map[k] + 1, v)
-            return True
-    return False
-
-def _delivery_log(action: str, client_id: str, event_id: str, details: str = ""):
-    now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
-    sh = gs().worksheet(SHEET_DELIVERY)
-    _append(sh, {"ts": now, "client_id": client_id, "event_id": event_id, "action": action, "details": details})
-
-def _upsert_rsvp(event_id: str, client_id: str, patch: Dict[str, str]):
-    sh = gs().worksheet(SHEET_RSVP)
-    rows = _find_rows(sh, lambda r: r.get("event_id")==event_id and r.get("client_id")==client_id)
-    if rows:
-        rownum, _ = rows[0]
-        for k, v in patch.items():
-            sh.update_cell(rownum, _col_index(sh, k), v)
-    else:
-        row = {"event_id": event_id, "client_id": client_id,
-               "rsvp":"", "remind_24h":"", "reminded_24h":"", "reminded_60m":"", "rsvp_at":""}
-        row.update(patch)
-        _append(sh, row)
-
-# ---- EventTypes titles + діагностика ----
-def _active_eventtypes_titles() -> List[str]:
+def messages_get(key: str, lang: str = "uk") -> str:
     try:
-        ws = gs().worksheet(SHEET_EVENTTYPES)
-        rows = _read_all(ws)
-        titles: List[str] = []
-        total = len(rows)
-        active_count = 0
+        w = ws(SHEET_MSG)
+        rows = get_all_records(w)
         for r in rows:
-            title = (r.get("title") or r.get("type") or r.get("type_code") or "").strip()
-            if not title:
-                continue
-            # М'який фільтр: якщо колонки/значення active немає — вважаємо активним
-            raw_active = r.get("active")
-            is_on = True if (raw_active is None or str(raw_active).strip()=="") else (str(raw_active).strip().lower() in ("1","true","yes","y"))
-            if is_on:
-                titles.append(title)
-                active_count += 1
-        try:
-            _delivery_log("diag_eventtypes", "-", "-", f"found={total}, active={active_count}, titles={len(titles)}")
-        except Exception:
-            pass
-        return titles
-    except Exception as e:
-        try:
-            _delivery_log("diag_eventtypes_fail", "-", "-", f"{e}")
-        except Exception:
-            pass
-        return []
-
-# ============================== Phase 1: Onboarding ===========================
-
-onboarding_router = Router(name="onboarding")
-
-class Onboard(StatesGroup):
-    ask_name = State()
-    ask_phone = State()
-
-def _valid_name(full_name: str) -> bool:
-    words = [w for w in re.split(r"\s+", (full_name or "").strip()) if w]
-    return len(words) >= 2 and all(re.match(r"^[\w\-’'А-Яа-яЇїІіЄєҐґA-Za-z]+$", w) for w in words)
-
-def _valid_phone(phone: str) -> bool:
-    p = (phone or "").strip().replace(" ", "")
-    return re.fullmatch(r"^\+?\d{10,15}$", p) is not None
-
-def _norm_phone(phone: str) -> str:
-    p = (phone or "").strip().replace(" ", "")
-    return p if p.startswith("+") else f"+{p}"
-
-def _norm_phone_val(val: str) -> str:
-    if not val:
-        return ""
-    v = val.replace(" ", "")
-    return v if v.startswith("+") else f"+{v}"
-
-def now_local_str() -> str:
-    return datetime.now(tz).strftime("%Y-%m-%d %H:%M")
-
-@onboarding_router.message(CommandStart())
-async def start_auto(message: Message, state: FSMContext):
-    payload = ""
-    if message.text:
-        parts = message.text.split(" ", 1)
-        payload = parts[1].strip() if len(parts) > 1 else ""
-    if payload.startswith("admin_"):
-        return  # адмін-роутер обробить
-
-    me_tg = str(message.from_user.id)
-    try:
-        ws = gs().worksheet(SHEET_CLIENTS)
-        existing_by_tg = _find_rows(ws, lambda r: (r.get("tg_user_id") or "") == me_tg)
-        if existing_by_tg:
-            rownum, _ = existing_by_tg[0]
-            ws.update_cell(rownum, _col_index(ws, "status"), "active")
-            ws.update_cell(rownum, _col_index(ws, "last_seen_at"), now_local_str())
-            await message.answer("✅ Ви вже підключені. Сповіщення активовано.")
-            await state.clear()
-            return
+            if str(r.get("key")).strip() == key and str(r.get("lang", "uk")).strip() == lang:
+                return str(r.get("text", "")).replace("\\n", "\n")
     except Exception:
         pass
+    # fallback невеликий, щоби не падати
+    FALLBACKS = {
+        "invite.title": "Запрошення на зустріч: {title}",
+        "invite.body": "{name}, запрошуємо на зустріч: {title}\n🗓 {date} о {time} (Київ)\nℹ️ {description}\nОберіть варіант нижче:",
+        "reminder.60m": "⏰ Нагадуємо: через 1 год почнеться {title}. Посилання: {link}",
+        "reminder.24h": "🔔 Нагадуємо: завтра о {time} відбудеться {title}.\nПосилання: {link}",
+        "feedback.ask": "Дякуємо за участь у *{title}*.\nОцініть, будь ласка (1–5 ⭐️) та додайте коментар.",
+        "update.notice": "🛠 Оновлення зустрічі {title}.\nЗверніть увагу: {what}",
+        "cancel.notice": "❌ Зустріч {title} скасовано. Ми надішлемо нову дату найближчим часом.",
+        "help.body": "👋 Це бот для запрошень на наші онлайн-зустрічі.",
+    }
+    return FALLBACKS.get(key, "")
 
-    await message.answer(
-        "👋 Вітаємо! Напишіть, будь ласка, ваше *ПІБ* (Прізвище Ім’я).\n"
-        "_Напр.: Петренко Іван_"
-    )
-    await state.set_state(Onboard.ask_name)
-
-@onboarding_router.message(Onboard.ask_name)
-async def ob_name(message: Message, state: FSMContext):
-    full_name = (message.text or "").strip()
-    if not _valid_name(full_name):
-        await message.reply(
-            "Здається, це не схоже на ПІБ. Вкажіть *прізвище та ім’я* (мінімум два слова).\n"
-            "_Напр.: Петренко Іван_"
-        )
-        return
-    await state.update_data(full_name=full_name)
-    await message.answer(
-        "Дякую! ✍️ Тепер надішліть *номер телефону* у міжнародному форматі.\n"
-        "_Напр.: +380671234567_"
-    )
-    await state.set_state(Onboard.ask_phone)
-
-async def _send_welcome_with_eventtypes(chat_id: int):
-    titles = _active_eventtypes_titles()
-    if titles:
-        lst = "\n".join([f"• {t}" for t in titles])
-        try:
-            await bot.send_message(chat_id, f"📅 *Наші регулярні конференції:*\n{lst}\n")
-        except Exception:
-            pass
-    else:
-        # явний фолбек — щоб не виглядало, ніби «забули»
-        try:
-            await bot.send_message(chat_id, "📅 Поки що немає опублікованих типів зустрічей (EventTypes). Скоро додамо 👇")
-        except Exception:
-            pass
+def log_action(action: str, client_id: Optional[str] = None,
+               event_id: Optional[str] = None, details: str = "") -> None:
     try:
-        await bot.send_message(
-            chat_id,
-            "🎉 Готово! Ви додані до системи.\n"
-            "Очікуйте запрошення на конференції — вони прийдуть у цей бот найближчим часом."
-        )
-    except Exception:
-        pass
-
-@onboarding_router.message(Onboard.ask_phone)
-async def ob_phone(message: Message, state: FSMContext):
-    raw_phone = (message.text or "").strip()
-    if not _valid_phone(raw_phone):
-        await message.reply("Будь ласка, введіть коректний телефон. _Напр.: +380671234567_")
-        return
-
-    data = await state.get_data()
-    full_name = data.get("full_name", "").strip()
-    me_tg = str(message.from_user.id)
-    phone = _norm_phone(raw_phone)
-
-    try:
-        ws = gs().worksheet(SHEET_CLIENTS)
-
-        # 1) tg вже є — оновлюємо та шлемо список + вітання
-        existing_by_tg = _find_rows(ws, lambda r: (r.get("tg_user_id") or "") == me_tg)
-        if existing_by_tg:
-            rownum, _ = existing_by_tg[0]
-            ws.update_cell(rownum, _col_index(ws, "full_name"), full_name)
-            ws.update_cell(rownum, _col_index(ws, "phone"), phone)
-            ws.update_cell(rownum, _col_index(ws, "status"), "active")
-            ws.update_cell(rownum, _col_index(ws, "last_seen_at"), now_local_str())
-            await _send_welcome_with_eventtypes(int(message.from_user.id))
-            await state.clear()
-            return
-
-        # 2) шукаємо за телефоном
-        norm = _norm_phone_val
-        by_phone = _find_rows(ws, lambda r: norm(r.get("phone") or "") == norm(phone))
-        if by_phone:
-            rownum, row = by_phone[0]
-            row_tg = (row.get("tg_user_id") or "").strip()
-            if not row_tg or row_tg == me_tg:
-                ws.update_cell(rownum, _col_index(ws, "tg_user_id"), me_tg)
-                ws.update_cell(rownum, _col_index(ws, "full_name"), full_name)
-                ws.update_cell(rownum, _col_index(ws, "status"), "active")
-                ws.update_cell(rownum, _col_index(ws, "last_seen_at"), now_local_str())
-                await _send_welcome_with_eventtypes(int(message.from_user.id))
-            else:
-                client_id = f"cl_{message.from_user.id}"
-                _append(ws, {
-                    "client_id": client_id,
-                    "tg_user_id": me_tg,
-                    "phone": phone,
-                    "full_name": full_name,
-                    "status": "active",
-                    "required_event_types": "",
-                    "created_at": now_local_str(),
-                    "last_seen_at": now_local_str(),
-                    "program": "",
-                })
-                await message.answer(
-                    "✅ Вас додано як нового клієнта. Якщо це ваш перший старт — усе гаразд.\n"
-                    "Якщо ви вже працювали з нами раніше — ми перевіримо дані."
-                )
-                await _send_welcome_with_eventtypes(int(message.from_user.id))
-                try:
-                    if SUPPORT_CHAT_ID:
-                        await message.bot.send_message(
-                            SUPPORT_CHAT_ID,
-                            (
-                                "⚠️ Можливий дубль за телефоном.\n"
-                                f"Новий TG: `{me_tg}`; ПІБ: {full_name}; Тел: {phone}\n"
-                                f"Існуючий рядок прив'язано до іншого TG."
-                            )
-                        )
-                except Exception:
-                    pass
-        else:
-            # 3) повністю новий клієнт
-            client_id = f"cl_{message.from_user.id}"
-            _append(ws, {
-                "client_id": client_id,
-                "tg_user_id": me_tg,
-                "phone": phone,
-                "full_name": full_name,
-                "status": "active",
-                "required_event_types": "",
-                "created_at": now_local_str(),
-                "last_seen_at": now_local_str(),
-                "program": "",
-            })
-            await _send_welcome_with_eventtypes(int(message.from_user.id))
-    except Exception:
-        await message.answer("На жаль, не вдалося записати дані. Спробуйте пізніше.")
-    finally:
-        await state.clear()
-
-# ============================== Phase 2: Admin =================================
-
-admin_router = Router(name="admin")
-
-def _parse_dt_local(s: str) -> Optional[datetime]:
-    s = (s or "").strip()
-    try:
-        if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$", s):
-            dt = datetime.strptime(s, "%Y-%m-%d %H:%M")
-            return tz.localize(dt)
-        dt = dateparser.parse(s, dayfirst=True)
-        if not dt:
-            return None
-        return dt.astimezone(tz) if dt.tzinfo else tz.localize(dt)
-    except Exception:
-        return None
-
-def _fmt_dt(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d %H:%M")
-
-def _event_by_id(event_id: str):
-    try:
-        ws = gs().worksheet(SHEET_EVENTS)
-        for r in _read_all(ws):
-            if r.get("event_id") == event_id:
-                return r
-    except Exception:
-        pass
-    return None
-
-async def _notify_going_update(event_id: str, text: str, action_key: str):
-    try:
-        wsr = gs().worksheet(SHEET_RSVP)
-        going = [r for r in _read_all(wsr) if r.get("event_id") == event_id and r.get("rsvp") == "going"]
-        if not going:
-            return
-        wsc = gs().worksheet(SHEET_CLIENTS)
-        clients = _read_all(wsc)
-        tg_map = {c.get("client_id"): c.get("tg_user_id") for c in clients}
-        for r in going:
-            chat_id = tg_map.get(r.get("client_id"))
-            if not chat_id:
-                continue
-            try:
-                await admin_router.bot.send_message(int(chat_id), text)
-                _delivery_log(action_key, r.get("client_id"), event_id, text)
-            except Exception:
-                _delivery_log("fail", r.get("client_id"), event_id, f"{action_key} send error")
-    except Exception:
-        pass
-
-@admin_router.message(CommandStart())
-async def admin_start_gate(message: Message, state: FSMContext):
-    payload = ""
-    if message.text:
-        parts = message.text.split(" ", 1)
-        payload = parts[1].strip() if len(parts) > 1 else ""
-    if not payload.startswith("admin_"):
-        return
-    token = unquote(payload[len("admin_"):])
-    is_admin = message.from_user.id in ADMIN_IDS
-    token_ok = (token == ADMIN_DEEPLINK_TOKEN)
-    if is_admin and token_ok:
-        await _show_admin_menu(message)
-    else:
-        # Дружній діагностичний фідбек (щоб швидко знайти проблему в ENV)
-        await message.answer(f"⛔️ Команда недоступна.\n_is_admin={is_admin}, token_ok={token_ok}_")
-
-@admin_router.message(Command("admin"))
-async def admin_cmd(message: Message):
-    if message.chat.type != "private":
-        return
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("⛔️ Лише для адмінів.")
-        return
-    await _show_admin_menu(message)
-
-# допоміжна: швидко дізнатись свій ID
-@admin_router.message(Command("myid"))
-async def my_id(message: Message):
-    if message.chat.type == "private":
-        await message.answer(f"Ваш Telegram ID: `{message.from_user.id}`")
-
-async def _show_admin_menu(message: Message):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Додати івент", callback_data="admin:add")
-    kb.button(text="📋 Ближчі івенти", callback_data="admin:list")
-    kb.adjust(1,1)
-    await message.answer("🔐 *Адмін-панель*. Оберіть дію:", reply_markup=kb.as_markup())
-
-def _admin_only(handler):
-    async def wrapped(callback: CallbackQuery, state: FSMContext):
-        if callback.message.chat.type != "private" or callback.from_user.id not in ADMIN_IDS:
-            await callback.answer("Недоступно", show_alert=True)
-            return
-        return await handler(callback, state)
-    return wrapped
-
-class CreateEvent(StatesGroup):
-    choosing_type = State()
-    entering_datetime = State()
-    entering_duration = State()
-    entering_link = State()
-    entering_title = State()
-    entering_description = State()
-    confirming = State()
-
-@admin_router.callback_query(F.data == "admin:add")
-@_admin_only
-async def add_event_start(cb: CallbackQuery, state: FSMContext):
-    try:
-        ws = gs().worksheet(SHEET_EVENTTYPES)
-        types = [r for r in _read_all(ws) if str(r.get("active","")).strip().lower() in ("1","true","yes")]
-        if not types:
-            await cb.message.answer("ℹ️ Немає активних типів у *EventTypes*.")
-            return
-        await state.update_data(types=types)
-        kb = InlineKeyboardBuilder()
-        for r in types[:50]:
-            code = r.get("type_code") or r.get("type")
-            title = r.get("title") or code
-            kb.button(text=f"{title}", callback_data=f"admin:add:type:{code}")
-        kb.button(text="↩️ Назад", callback_data="admin:back")
-        kb.adjust(1)
-        await cb.message.answer("Оберіть *тип події*:", reply_markup=kb.as_markup())
-        await state.set_state(CreateEvent.choosing_type)
-    except Exception:
-        await cb.message.answer("Помилка читання *EventTypes*. Перевірте доступи.")
-
-@admin_router.callback_query(F.data.startswith("admin:add:type:"))
-@_admin_only
-async def add_event_type_selected(cb: CallbackQuery, state: FSMContext):
-    type_code = cb.data.split(":")[-1]
-    await state.update_data(new_event={"type": type_code})
-    await cb.message.answer("Вкажіть *дату і час* у форматі `YYYY-MM-DD HH:MM` (Київ)\n_Напр.: 2025-10-05 18:00_")
-    await state.set_state(CreateEvent.entering_datetime)
-
-@admin_router.message(CreateEvent.entering_datetime)
-async def add_event_dt(msg: Message, state: FSMContext):
-    dt = _parse_dt_local(msg.text)
-    if not dt:
-        await msg.answer("Не вдалося розпізнати дату/час. Приклад: `2025-10-05 18:00`")
-        return
-    d = await state.get_data(); ev = d.get("new_event", {}); ev["start_at"] = _fmt_dt(dt)
-    await state.update_data(new_event=ev)
-    await msg.answer("⏱ Вкажіть *тривалість* у хвилинах (за замовчуванням 60).")
-    await state.set_state(CreateEvent.entering_duration)
-
-@admin_router.message(CreateEvent.entering_duration)
-async def add_event_duration(msg: Message, state: FSMContext):
-    txt = (msg.text or "").strip()
-    if not txt:
-        dur = 60
-    else:
-        try:
-            dur = int(txt); assert 1 <= dur <= 360
-        except Exception:
-            await msg.answer("Будь ласка, число хвилин 1..360. _Напр.: 60_")
-            return
-    d = await state.get_data(); ev = d.get("new_event", {}); ev["duration_min"] = str(dur)
-    await state.update_data(new_event=ev)
-    await msg.answer("🔗 Надішліть *посилання* на конференцію (https://...)")
-    await state.set_state(CreateEvent.entering_link)
-
-@admin_router.message(CreateEvent.entering_link)
-async def add_event_link(msg: Message, state: FSMContext):
-    link = (msg.text or "").strip()
-    if not (link.startswith("http://") or link.startswith("https://")):
-        await msg.answer("Повний URL (https://...)")
-        return
-    d = await state.get_data(); ev = d.get("new_event", {}); ev["link"] = link
-    await state.update_data(new_event=ev)
-    await msg.answer("📝 Заголовок (_можна пропустити — надішліть «-»_)")
-    await state.set_state(CreateEvent.entering_title)
-
-@admin_router.message(CreateEvent.entering_title)
-async def add_event_title(msg: Message, state: FSMContext):
-    title = (msg.text or "").strip()
-    d = await state.get_data(); ev = d.get("new_event", {}); ev["title"] = "" if title == "-" else title
-    await state.update_data(new_event=ev)
-    await msg.answer("ℹ️ Опис (_можна пропустити — надішліть «-»_)")
-    await state.set_state(CreateEvent.entering_description)
-
-@admin_router.message(CreateEvent.entering_description)
-async def add_event_desc(msg: Message, state: FSMContext):
-    desc = (msg.text or "").strip()
-    d = await state.get_data(); ev = d.get("new_event", {}); ev["description"] = "" if desc == "-" else desc
-    await state.update_data(new_event=ev)
-    ev = (await state.get_data()).get("new_event", {})
-    preview = (
-        f"*Попередній перегляд:*\n"
-        f"• Тип: `{ev.get('type')}`\n"
-        f"• Час: `{ev.get('start_at')}` (Київ)\n"
-        f"• Тривалість: `{ev.get('duration_min')} хв`\n"
-        f"• Лінк: {ev.get('link')}\n"
-        f"• Заголовок: {ev.get('title') or '— (із EventTypes)'}\n"
-        f"• Опис: {ev.get('description') or '— (із EventTypes)'}"
-    )
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Зберегти", callback_data="admin:add:confirm")
-    kb.button(text="↩️ Скасувати", callback_data="admin:back")
-    kb.adjust(1,1)
-    await msg.answer(preview, reply_markup=kb.as_markup())
-    await state.set_state(CreateEvent.confirming)
-
-@admin_router.callback_query(F.data == "admin:back")
-async def admin_back(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await _show_admin_menu(cb.message)
-
-@admin_router.callback_query(F.data == "admin:add:confirm")
-async def add_event_save(cb: CallbackQuery, state: FSMContext):
-    ev = (await state.get_data()).get("new_event", {})
-    if not ev:
-        await cb.message.answer("Немає даних про івент.")
-        return
-    try:
-        wt = gs().worksheet(SHEET_EVENTTYPES)
-        trow = next((r for r in _read_all(wt) if (r.get("type_code") or r.get("type")) == ev["type"]), None)
-        if trow:
-            if not ev.get("title"): ev["title"] = trow.get("title","")
-            if not ev.get("description"): ev["description"] = trow.get("description","")
-    except Exception:
-        pass
-
-    try:
-        we = gs().worksheet(SHEET_EVENTS)
-        event_id = f"evt_{uuid.uuid4().hex[:8]}"
-        _append(we, {
-            "event_id": event_id,
-            "type": ev["type"],
-            "title": ev.get("title",""),
-            "description": ev.get("description",""),
-            "start_at": ev["start_at"],
-            "duration_min": ev["duration_min"],
-            "link": ev["link"],
-            "created_by": cb.from_user.username or str(cb.from_user.id),
-            "created_at": datetime.now(tz).strftime("%Y-%m-%d %H:%M"),
-            "broadcasted_at": "",
+        w = ws(SHEET_LOG)
+        append_dict(w, {
+            "ts": now_kyiv().strftime("%Y-%m-%d %H:%M:%S"),
+            "client_id": client_id or "",
+            "event_id": event_id or "",
+            "action": action,
+            "details": details or "",
         })
-        await cb.message.answer("✅ Подію збережено. Знайдете її у «Ближчі івенти».")
-        await admin_back(cb, state)
-    except Exception:
-        await cb.message.answer("❌ Не вдалося зберегти подію.")
-
-@admin_router.callback_query(F.data == "admin:list")
-@_admin_only
-async def list_upcoming(cb: CallbackQuery, state: FSMContext):
-    try:
-        we = gs().worksheet(SHEET_EVENTS)
-        rows = _read_all(we)
-        now_ = datetime.now(tz)
-        horizon = now_ + timedelta(days=14)
-        upcoming = []
-        for r in rows:
-            dt = _parse_dt_local(r.get("start_at",""))
-            if not dt:
-                continue
-            if now_ <= dt <= horizon:
-                upcoming.append((dt, r))
-        if not upcoming:
-            await cb.message.answer("ℹ️ Найближчих подій (14 днів) не знайдено.")
-            return
-        upcoming.sort(key=lambda x: x[0])
-        kb = InlineKeyboardBuilder()
-        text = "*Ближчі події (14 днів):*\n"
-        for dt, r in upcoming[:50]:
-            line = f"- `{r.get('event_id')}` • {r.get('title') or r.get('type')} • {dt.strftime('%Y-%m-%d %H:%M')}"
-            text += line + "\n"
-            kb.button(text=f"🔎 {r.get('title') or r.get('type')} {dt.strftime('%m-%d %H:%M')}",
-                      callback_data=f"admin:ev:{r.get('event_id')}")
-        kb.button(text="↩️ Назад", callback_data="admin:back")
-        kb.adjust(1)
-        await cb.message.answer(text, reply_markup=kb.as_markup())
-    except Exception:
-        await cb.message.answer("Помилка читання *Events*.")
-
-@admin_router.callback_query(F.data.startswith("admin:ev:"))
-@_admin_only
-async def event_card(cb: CallbackQuery, state: FSMContext):
-    event_id = cb.data.split(":")[-1]
-    ev = _event_by_id(event_id)
-    if not ev:
-        await cb.message.answer("Подію не знайдено.")
-        return
-    dt = _parse_dt_local(ev.get("start_at",""))
-    dts = dt.strftime("%Y-%m-%d %H:%M") if dt else ev.get("start_at","")
-    text = (
-        f"*Подія:* `{ev.get('event_id')}`\n"
-        f"• Тип: `{ev.get('type')}`\n"
-        f"• Назва: {ev.get('title') or '—'}\n"
-        f"• Час: {dts}\n"
-        f"• Тривалість: {ev.get('duration_min') or '—'} хв\n"
-        f"• Лінк: {ev.get('link')}\n"
-        f"• Опис: {ev.get('description') or '—'}"
-    )
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✏️ Оновити", callback_data=f"admin:update:{event_id}")
-    kb.button(text="❌ Скасувати", callback_data=f"admin:cancel:{event_id}")
-    kb.button(text="↩️ Назад", callback_data="admin:list")
-    kb.adjust(2,1)
-    await cb.message.answer(text, reply_markup=kb.as_markup())
-
-class UpdateEvent(StatesGroup):
-    picking_field = State()
-    entering_value = State()
-
-_ALLOWED_FIELDS = ("start_at", "duration_min", "link", "title", "description")
-
-@admin_router.callback_query(F.data.startswith("admin:update:"))
-@_admin_only
-async def update_choose_field(cb: CallbackQuery, state: FSMContext):
-    event_id = cb.data.split(":")[-1]
-    await state.update_data(event_id=event_id)
-    kb = InlineKeyboardBuilder()
-    for fld in _ALLOWED_FIELDS:
-        kb.button(text=fld, callback_data=f"admin:update:field:{fld}")
-    kb.button(text="↩️ Назад", callback_data=f"admin:ev:{event_id}")
-    kb.adjust(3,2,1)
-    await cb.message.answer("Оберіть поле для оновлення:", reply_markup=kb.as_markup())
-    await state.set_state(UpdateEvent.picking_field)
-
-@admin_router.callback_query(F.data.startswith("admin:update:field:"))
-@_admin_only
-async def update_enter_value_prompt(cb: CallbackQuery, state: FSMContext):
-    fld = cb.data.split(":")[-1]
-    await state.update_data(field=fld)
-    hint = {
-        "start_at": "у форматі `YYYY-MM-DD HH:MM` (Київ)",
-        "duration_min": "число хвилин (1..360)",
-        "link": "повний URL (https://...)",
-        "title": "текст заголовка",
-        "description": "текст опису",
-    }[fld]
-    await cb.message.answer(f"Введіть нове значення для *{fld}* ({hint}):")
-    await state.set_state(UpdateEvent.entering_value)
-
-@admin_router.message(UpdateEvent.entering_value)
-async def update_apply_value(msg: Message, state: FSMContext):
-    d = await state.get_data()
-    event_id = d.get("event_id")
-    field = d.get("field")
-    val = (msg.text or "").strip()
-    if field == "start_at":
-        dt = _parse_dt_local(val)
-        if not dt:
-            await msg.answer("Невалідна дата/час. Приклад: `2025-10-05 18:00`")
-            return
-        val = _fmt_dt(dt)
-    elif field == "duration_min":
-        try:
-            iv = int(val); assert 1 <= iv <= 360
-        except Exception:
-            await msg.answer("Вкажіть число хвилин 1..360.")
-            return
-    elif field == "link":
-        if not (val.startswith("http://") or val.startswith("https://")):
-            await msg.answer("Повний URL (https://...)")
-            return
-
-    try:
-        we = gs().worksheet(SHEET_EVENTS)
-        ok = _update_row_by_key(we, "event_id", event_id, {field: val})
-        if not ok:
-            await msg.answer("Не знайшов подію для оновлення.")
-            await state.clear()
-            return
-        ev = _event_by_id(event_id) or {}
-        title = ev.get("title") or ev.get("type") or "Подія"
-        await _notify_going_update(event_id, f"🛠 Оновлення: *{title}*. Змінено `{field}`.", "update_sent")
-        await msg.answer("✅ Оновлено.")
-        await state.clear()
-    except Exception:
-        await msg.answer("❌ Помилка оновлення.")
-        await state.clear()
-
-@admin_router.callback_query(F.data.startswith("admin:cancel:"))
-@_admin_only
-async def cancel_event(cb: CallbackQuery, state: FSMContext):
-    event_id = cb.data.split(":")[-1]
-    ev = _event_by_id(event_id)
-    if not ev:
-        await cb.message.answer("Подію не знайдено.")
-        return
-    try:
-        we = gs().worksheet(SHEET_EVENTS)
-        row = _find_rows(we, lambda r: r.get("event_id") == event_id)[0][0]
-        new_title = ev.get("title") or ev.get("type") or ""
-        if not new_title.startswith("[СКАСОВАНО]"):
-            new_title = f"[СКАСОВАНО] {new_title}"
-        we.update_cell(row, _col_index(we, "title"), new_title)
-        await _notify_going_update(event_id, "❌ Зустріч скасовано. Надішлемо нову дату найближчим часом.", "cancel_notice_sent")
-        await cb.message.answer("✅ Подію скасовано та повідомлено учасників.")
-    except Exception:
-        await cb.message.answer("❌ Не вдалося скасувати подію.")
-
-# ============================== Phase 3: Invites/RSVP/Reminders ===============
-
-phase3_router = Router(name="phase3")
-_BOT_PHASE3 = None
-def init_phase3(bot_instance):
-    global _BOT_PHASE3
-    _BOT_PHASE3 = bot_instance
-
-def parse_dt_local(s: str) -> Optional[datetime]:
-    s = (s or "").strip()
-    try:
-        if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$", s):
-            return tz.localize(datetime.strptime(s, "%Y-%m-%d %H:%M"))
-        dt = dateparser.parse(s, dayfirst=True)
-        if not dt: return None
-        return dt.astimezone(tz) if dt.tzinfo else tz.localize(dt)
-    except Exception:
-        return None
-
-def fmt_date(dt: datetime) -> Tuple[str, str]:
-    return dt.strftime("%d.%m.%Y"), dt.strftime("%H:%M")
-
-# windows
-REMINDER24_WINDOW = (23*60 - 10, 24*60 + 10)
-REMINDER60_WINDOW = (55, 65)
-
-QUIET_HOURS = None  # (22,8) якщо треба
-
-def within_quiet_hours(dt: datetime) -> bool:
-    if not QUIET_HOURS: return False
-    start, end = QUIET_HOURS
-    h = dt.hour
-    return (start <= h < end) if start < end else (h >= start or h < end)
-
-import hmac, hashlib
-def sign_payload(payload: str) -> str:
-    return hmac.new(SECRET_HMAC_KEY.encode("utf-8"), payload.encode("utf-8"),
-                    hashlib.sha256).hexdigest()[:16]
-
-def make_cb(action: str, event_id: str, client_id: str) -> str:
-    ts_ = int(datetime.now(tz).timestamp())
-    raw = f"{action}|{event_id}|{client_id}|{ts_}"
-    return f"{raw}|{sign_payload(raw)}"
-
-def verify_cb(data: str):
-    try:
-        action, event_id, client_id, ts, sig = data.split("|")
-        raw = f"{action}|{event_id}|{client_id}|{ts}"
-        return sign_payload(raw) == sig, {"action": action, "event_id": event_id, "client_id": client_id}
-    except Exception:
-        return False, {}
-
-def tmpl(key: str, lang="uk") -> Optional[str]:
-    try:
-        ws = gs().worksheet(SHEET_MESSAGES)
-        for r in _read_all(ws):
-            if r.get("key") == key and r.get("lang") == lang:
-                return r.get("text") or ""
     except Exception:
         pass
-    return None
 
-def default_invite(name: str, title: str, date_str: str, time_str: str, description: str) -> str:
-    return (f"{name}, запрошуємо на зустріч: *{title}*\n"
-            f"🗓 {date_str} о {time_str} (Київ)\n"
-            f"ℹ️ {description}\n"
-            "Виберіть варіант нижче:")
-
-def _has_active_offer_for_type(client_id: str, ev_type: str,
-                               events: List[Dict[str,str]],
-                               rsvps: List[Dict[str,str]],
-                               attendance: List[Dict[str,str]]) -> bool:
-    ev_map = {e.get("event_id"): (e.get("type"), parse_dt_local(e.get("start_at",""))) for e in events}
-    for a in attendance:
-        if a.get("client_id") == client_id and str(a.get("attended","")).lower() in ("true","1","yes"):
-            t = ev_map.get(a.get("event_id"), (None, None))[0]
-            if t == ev_type:
+def has_log(action: str, client_id: str, event_id: str) -> bool:
+    try:
+        w = ws(SHEET_LOG)
+        rows = get_all_records(w)
+        for r in rows:
+            if str(r.get("action")) == action and str(r.get("client_id")) == client_id and str(r.get("event_id")) == event_id:
                 return True
-    for r in rsvps:
-        if r.get("client_id") != client_id:
-            continue
-        eid = r.get("event_id")
-        t, dt = ev_map.get(eid, (None, None))
-        if t != ev_type or not dt:
-            continue
-        if dt <= datetime.now(tz):
-            continue
-        v = (r.get("rsvp") or "").strip()
-        if v in ("going", "remind_me", ""):
-            return True
+    except Exception:
+        return False
     return False
 
-async def _send_invite_to_client(bot, ev: Dict[str,str], client: Dict[str,str], title: str, description: str) -> bool:
-    cid = client.get("client_id")
-    chat_id = client.get("tg_user_id")
-    if not chat_id:
-        return False
-    start = parse_dt_local(ev.get("start_at",""))
-    if not start:
-        return False
-    date_str, time_str = fmt_date(start)
+def get_eventtypes_active() -> List[Dict[str, Any]]:
+    w = ws(SHEET_EVENTTYPES)
+    rows = get_all_records(w)
+    return [r for r in rows if a2i(r.get("active"), 0) == 1]
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Так, буду", callback_data=make_cb("going", ev["event_id"], cid)),
-            InlineKeyboardButton(text="🚫 Не зможу", callback_data=make_cb("not", ev["event_id"], cid)),
-        ],
-        [
-            InlineKeyboardButton(text="🔔 Нагадати за 24 год", callback_data=make_cb("rem24", ev["event_id"], cid))
-        ]
+def get_eventtype_by_code(type_code: int) -> Optional[Dict[str, Any]]:
+    for r in get_eventtypes_active():
+        if a2i(r.get("type_code"), -1) == int(type_code):
+            return r
+    return None
+
+def client_id_for_tg(tg_user_id: int) -> str:
+    return f"cl_{tg_user_id}"
+
+def get_client_by_tg(tg_user_id: int) -> Optional[Dict[str, Any]]:
+    w = ws(SHEET_CLIENTS)
+    rows = get_all_records(w)
+    for r in rows:
+        if str(r.get("tg_user_id")).strip() == str(tg_user_id):
+            return r
+    return None
+
+def upsert_client(tg_user_id: int, full_name: str, phone: str, status: str = "active") -> Dict[str, Any]:
+    w = ws(SHEET_CLIENTS)
+    cid = client_id_for_tg(tg_user_id)
+    now = iso_dt()
+    payload = {
+        "client_id": cid,
+        "tg_user_id": tg_user_id,
+        "phone": phone,
+        "full_name": full_name,
+        "status": status,
+        "created_at": now,
+        "last_seen_at": now,
+    }
+    existing_row = find_row_by_value(w, "tg_user_id", tg_user_id)
+    if existing_row:
+        # зберігаємо created_at зі старого
+        old = w.row_values(existing_row)
+        headers = ws_headers(w)
+        try:
+            old_map = {headers[i]: old[i] if i < len(old) else "" for i in range(len(headers))}
+            payload["created_at"] = old_map.get("created_at", now)
+        except Exception:
+            pass
+        update_row_dict(w, existing_row, payload)
+    else:
+        append_dict(w, payload)
+    log_action("client_registered", client_id=cid, event_id=None, details=f"tg={tg_user_id}")
+    return payload
+
+def touch_client_seen(tg_user_id: int) -> None:
+    w = ws(SHEET_CLIENTS)
+    row = find_row_by_value(w, "tg_user_id", tg_user_id)
+    if row:
+        update_cell(w, row, "last_seen_at", iso_dt())
+
+def list_active_clients() -> List[Dict[str, Any]]:
+    w = ws(SHEET_CLIENTS)
+    rows = get_all_records(w)
+    return [r for r in rows if str(r.get("status", "")).strip().lower() == "active"]
+
+def create_event(type_code: int, title: str, description: str, start_at: str,
+                 duration_min: int, link: str, created_by: str) -> Dict[str, Any]:
+    w = ws(SHEET_EVENTS)
+    event_id = f"ev_{short_uuid(10)}"
+    payload = {
+        "event_id": event_id,
+        "type": int(type_code),
+        "title": title,
+        "description": description,
+        "start_at": start_at,
+        "duration_min": int(duration_min),
+        "link": link,
+        "created_by": created_by,
+        "created_at": iso_dt(),
+    }
+    append_dict(w, payload)
+    log_action("event_created", client_id=None, event_id=event_id, details=f"type={type_code}")
+    return payload
+
+def get_all_events() -> List[Dict[str, Any]]:
+    w = ws(SHEET_EVENTS)
+    return get_all_records(w)
+
+def get_event_by_id(event_id: str) -> Optional[Dict[str, Any]]:
+    for r in get_all_events():
+        if str(r.get("event_id")).strip() == event_id:
+            return r
+    return None
+
+def update_event_field(event_id: str, field: str, value: Any) -> None:
+    w = ws(SHEET_EVENTS)
+    row = find_row_by_value(w, "event_id", event_id)
+    if row:
+        update_cell(w, row, field, value)
+        log_action("event_updated", client_id=None, event_id=event_id, details=f"{field}={value}")
+
+def delete_event(event_id: str) -> None:
+    w = ws(SHEET_EVENTS)
+    row = find_row_by_value(w, "event_id", event_id)
+    if row:
+        delete_row(w, row)
+        log_action("event_canceled", client_id=None, event_id=event_id, details="deleted")
+
+def event_start_dt(event: Dict[str, Any]) -> Optional[datetime]:
+    return parse_dt(str(event.get("start_at", "")).strip())
+
+def list_future_events_sorted() -> List[Dict[str, Any]]:
+    now = now_kyiv()
+    events = []
+    for e in get_all_events():
+        dt = event_start_dt(e)
+        if dt and dt >= now - timedelta(days=1):
+            events.append((dt, e))
+    events.sort(key=lambda x: x[0])
+    return [e for _, e in events]
+
+def list_alternative_events_same_type(type_code: int, exclude_event_id: str) -> List[Dict[str, Any]]:
+    out = []
+    now = now_kyiv()
+    for e in get_all_events():
+        if a2i(e.get("type")) == int(type_code) and str(e.get("event_id")) != exclude_event_id:
+            dt = event_start_dt(e)
+            if dt and dt >= now:
+                out.append((dt, e))
+    out.sort(key=lambda x: x[0])
+    return [e for _, e in out]
+
+def mark_attendance(event_id: str, client_id: str, attended: int = 1) -> None:
+    w = ws(SHEET_ATTEND)
+    row = None
+    # унікально по (event_id, client_id)
+    rows = get_all_records(w)
+    for i, r in enumerate(rows, start=2):
+        if str(r.get("event_id")) == event_id and str(r.get("client_id")) == client_id:
+            row = i
+            break
+    payload = {
+        "event_id": event_id,
+        "client_id": client_id,
+        "attended": int(attended),
+        "marked_at": iso_dt(),
+    }
+    if row:
+        update_row_dict(w, row, payload)
+    else:
+        append_dict(w, payload)
+    log_action("attendance_marked", client_id=client_id, event_id=event_id, details=f"attended={attended}")
+
+def client_has_attended_type(client_id: str, type_code: int) -> bool:
+    events_by_id = {e.get("event_id"): e for e in get_all_events()}
+    w = ws(SHEET_ATTEND)
+    rows = get_all_records(w)
+    for r in rows:
+        if str(r.get("client_id")) == client_id and a2i(r.get("attended")) == 1:
+            ev = events_by_id.get(str(r.get("event_id")))
+            if ev and a2i(ev.get("type")) == int(type_code):
+                return True
+    return False
+
+def rsvp_upsert(event_id: str, client_id: str, rsvp: Optional[str] = None,
+                remind_24h: Optional[int] = None,
+                reminded_24h: Optional[int] = None,
+                reminded_60m: Optional[int] = None) -> None:
+    w = ws(SHEET_RSVP)
+    rows = get_all_records(w)
+    row_idx = None
+    for i, r in enumerate(rows, start=2):
+        if str(r.get("event_id")) == event_id and str(r.get("client_id")) == client_id:
+            row_idx = i
+            base = r
+            break
+    base = base if row_idx else {}
+    payload = {
+        "event_id": event_id,
+        "client_id": client_id,
+        "rsvp": rsvp if rsvp is not None else base.get("rsvp", ""),
+        "remind_24h": int(remind_24h) if remind_24h is not None else a2i(base.get("remind_24h"), 0),
+        "reminded_24h": int(reminded_24h) if reminded_24h is not None else a2i(base.get("reminded_24h"), 0),
+        "reminded_60m": int(reminded_60m) if reminded_60m is not None else a2i(base.get("reminded_60m"), 0),
+        "rsvp_at": iso_dt(),
+    }
+    if row_idx:
+        update_row_dict(w, row_idx, payload)
+    else:
+        append_dict(w, payload)
+
+def rsvp_get_for_event(event_id: str) -> List[Dict[str, Any]]:
+    w = ws(SHEET_RSVP)
+    return [r for r in get_all_records(w) if str(r.get("event_id")) == event_id]
+
+def feedback_save(event_id: str, client_id: str, stars: int, comment: str = "") -> None:
+    w = ws(SHEET_FEEDBACK)
+    payload = {
+        "event_id": event_id,
+        "client_id": client_id,
+        "stars": int(stars),
+        "comment": comment or "",
+        "owner": "",
+    }
+    # перезапис по унікальному ключу (event_id, client_id) — простий варіант: add новий рядок
+    append_dict(w, payload)
+    if stars < 4:
+        log_action("feedback_low_routed", client_id=client_id, event_id=event_id, details=f"stars={stars}")
+
+def feedback_assign_owner(event_id: str, client_id: str, owner: str) -> None:
+    w = ws(SHEET_FEEDBACK)
+    rows = get_all_records(w)
+    # знаходимо останній запис для пари
+    last_idx = None
+    for i, r in enumerate(rows, start=2):
+        if str(r.get("event_id")) == event_id and str(r.get("client_id")) == client_id:
+            last_idx = i
+    if last_idx:
+        update_cell(w, last_idx, "owner", owner)
+
+# ============================== UI BUILDERS ===================================
+
+def kb_admin_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Додати конференцію", callback_data="admin:add")],
+        [InlineKeyboardButton("📋 Список конференцій", callback_data="admin:list:0")]
     ])
 
-    template = tmpl("invite.body","uk") or default_invite("{name}", "{title}", "{date}", "{time}", "{description}")
-    text = (template
-            .replace("{name}", client.get("full_name") or "Клієнт")
-            .replace("{title}", title or ev.get("type"))
-            .replace("{date}", date_str)
-            .replace("{time}", time_str)
-            .replace("{description}", description or ""))
+def kb_rsvp(event_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Так, буду", callback_data=f"rsvp:{event_id}:going"),
+            InlineKeyboardButton("🚫 Не зможу", callback_data=f"rsvp:{event_id}:declined"),
+        ],
+        [InlineKeyboardButton("🔔 Нагадати за 24 год", callback_data=f"rsvp:{event_id}:remind")],
+    ])
 
-    try:
-        await bot.send_message(int(chat_id), text, reply_markup=kb)
-        _delivery_log("invite_sent", cid, ev["event_id"], "")
-        _upsert_rsvp(ev["event_id"], cid, {})  # pending
-        return True
-    except Exception as e:
-        _delivery_log("fail", cid, ev["event_id"], f"invite: {e}")
-        return False
+def kb_edit_event_menu(event_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Назва", callback_data=f"admin:edit:{event_id}:field:title")],
+        [InlineKeyboardButton("✏️ Опис", callback_data=f"admin:edit:{event_id}:field:description")],
+        [InlineKeyboardButton("🗓 Дата/час", callback_data=f"admin:edit:{event_id}:field:start_at")],
+        [InlineKeyboardButton("⏱ Тривалість (хв)", callback_data=f"admin:edit:{event_id}:field:duration_min")],
+        [InlineKeyboardButton("🔗 Посилання", callback_data=f"admin:edit:{event_id}:field:link")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:list:0")]
+    ])
 
-async def do_broadcast(event_id: str):
-    if not _BOT_PHASE3:
+def kb_event_actions(event_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Змінити", callback_data=f"admin:edit:{event_id}")],
+        [InlineKeyboardButton("❌ Скасувати", callback_data=f"admin:cancel:{event_id}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin:list:0")]
+    ])
+
+def kb_cancel_confirm(event_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Так, скасувати", callback_data=f"admin:cancel:{event_id}:yes")],
+        [InlineKeyboardButton("⬅️ Ні, назад", callback_data=f"admin:edit:{event_id}")]
+    ])
+
+def kb_claim_feedback(event_id: str, client_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛠 Беру в роботу", callback_data=f"claim:{event_id}:{client_id}")]
+    ])
+
+# ============================== STATE STORAGE =================================
+
+ADMINS: set[int] = set()
+USER_STATE: Dict[int, Dict[str, Any]] = {}   # простий FSM у пам'яті
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMINS
+
+def require_admin(update: Update) -> bool:
+    uid = update.effective_user.id if update.effective_user else 0
+    return is_admin(uid)
+
+def set_state(user_id: int, mode: str, step: str, data: Optional[Dict[str, Any]] = None):
+    USER_STATE[user_id] = {"mode": mode, "step": step, "data": data or {}}
+
+def get_state(user_id: int) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
+    s = USER_STATE.get(user_id, {})
+    return s.get("mode"), s.get("step"), s.get("data", {})
+
+def clear_state(user_id: int):
+    USER_STATE.pop(user_id, None)
+
+# ================================ HANDLERS ====================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    args = context.args or []
+    arg = args[0] if args else ""
+    touch_client_seen(user.id)
+
+    # Адмін-режим через deep-link: /start admin_<password>
+    if arg.startswith("admin_"):
+        pwd = arg.split("admin_", 1)[1]
+        if pwd == ADMIN_PASSWORD:
+            ADMINS.add(user.id)
+            await msg.reply_text("Вітаю в адмін-панелі.", reply_markup=kb_admin_main())
+            return
+        else:
+            await msg.reply_text("Невірний пароль для адмін-панелі.")
+            return
+
+    # Клієнтський старт
+    cli = get_client_by_tg(user.id)
+    if not cli or not cli.get("full_name") or not cli.get("phone"):
+        await msg.reply_text("👋 Привіт! Вкажіть, будь ласка, Ваше ПІБ (українською).")
+        set_state(user.id, "register", "wait_name", {})
         return
-    try:
-        we = gs().worksheet(SHEET_EVENTS)
-        events = _read_all(we)
-        ev = next((r for r in events if r.get("event_id") == event_id), None)
-        if not ev: return
 
-        title = ev.get("title") or ""
-        description = ev.get("description") or ""
-        try:
-            wt = gs().worksheet(SHEET_EVENTTYPES)
-            trow = next((r for r in _read_all(wt) if r.get("type") == ev.get("type") or r.get("type_code") == ev.get("type")), None)
-            if trow:
-                if not title: title = trow.get("title","")
-                if not description: description = trow.get("description","")
-        except Exception:
-            pass
+    # Уже зареєстрований — показ переліку типів з відмітками
+    await send_welcome_and_types_list(update, context, cli)
 
-        start = parse_dt_local(ev.get("start_at",""))
-        if not start:
+async def send_welcome_and_types_list(update: Update, context: ContextTypes.DEFAULT_TYPE, cli: Dict[str, Any]):
+    user = update.effective_user
+    msg = update.effective_message
+    text = (
+        "✅ Ви підключені до розсилки на конференції.\n"
+        "Надсилатимемо інвайти на найближчі події.\n\n"
+        "Доступні типи конференцій:\n"
+    )
+    rows = get_eventtypes_active()
+    # Визначаємо відвідані по типу
+    lines = []
+    for rt in rows:
+        tcode = a2i(rt.get("type_code"))
+        title = str(rt.get("title"))
+        attended = client_has_attended_type(cli["client_id"], tcode)
+        flag = "✅ Був(ла)" if attended else "⭕️ Ще не був(ла)"
+        lines.append(f"• {title} — {flag}")
+    text += "\n".join(lines) if lines else "Наразі немає активних типів."
+    await msg.reply_text(text)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(messages_get("help.body"))
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = update.effective_message
+    mode, step, data = get_state(user.id)
+
+    # Реєстрація клієнта: ПІБ -> телефон
+    if mode == "register" and step == "wait_name":
+        full_name = (msg.text or "").strip()
+        if len(full_name) < 3:
+            await msg.reply_text("Будь ласка, введіть коректне ПІБ (не менше 3 символів).")
             return
-        if QUIET_HOURS and within_quiet_hours(datetime.now(tz)):
-            return
-
-        wc = gs().worksheet(SHEET_CLIENTS); clients = [c for c in _read_all(wc) if c.get("status")=="active" and c.get("tg_user_id")]
-        wr = gs().worksheet(SHEET_RSVP); rsvps = _read_all(wr)
-        wa = gs().worksheet(SHEET_ATTENDANCE); attendance = _read_all(wa)
-
-        sent_any = False
-        for cl in clients:
-            cid = cl.get("client_id")
-            if _has_active_offer_for_type(cid, ev.get("type"), events, rsvps, attendance):
-                continue
-            ok = await _send_invite_to_client(_BOT_PHASE3, ev, cl, title, description)
-            sent_any = sent_any or ok
-            await asyncio.sleep(0.04)
-
-        if sent_any or ev.get("broadcasted_at","") == "":
-            _update_row_by_key(we, "event_id", event_id, {"broadcasted_at": datetime.now(tz).strftime("%Y-%m-%d %H:%M")})
-    except Exception:
-        pass
-
-async def job_broadcast_new():
-    if not _BOT_PHASE3: return
-    try:
-        we = gs().worksheet(SHEET_EVENTS)
-        for r in _read_all(we):
-            if not r.get("broadcasted_at"):
-                await do_broadcast(r.get("event_id"))
-    except Exception:
-        pass
-
-@phase3_router.callback_query(F.data.regexp(r"^(going|not|rem24)\|"))
-async def on_rsvp_click(cb: CallbackQuery):
-    ok, p = verify_cb(cb.data)
-    if not ok:
-        await cb.answer("Невірний підпис кнопки", show_alert=True); return
-    action = p["action"]; event_id = p["event_id"]
-
-    try:
-        wc = gs().worksheet(SHEET_CLIENTS)
-        me = next((r for r in _read_all(wc) if r.get("tg_user_id")==str(cb.from_user.id)), None)
-        if not me:
-            await cb.answer("Спочатку пройдіть коротку реєстрацію.", show_alert=True); return
-        client_id = me.get("client_id")
-    except Exception:
-        await cb.answer("Помилка доступу до бази.", show_alert=True); return
-
-    if action == "going":
-        _upsert_rsvp(event_id, client_id, {
-            "rsvp": "going",
-            "remind_24h": "TRUE",
-            "reminded_24h": "",
-            "reminded_60m": "",
-            "rsvp_at": datetime.now(tz).strftime("%Y-%m-%d %H:%M"),
-        })
-        _delivery_log("rsvp_going", client_id, event_id, "")
-        await cb.message.answer("✅ Записав. Нагадаю *за 24 год* і *за 1 год* до початку.")
-        await cb.answer(); return
-    if action == "not":
-        _upsert_rsvp(event_id, client_id, {
-            "rsvp": "not_going",
-            "rsvp_at": datetime.now(tz).strftime("%Y-%m-%d %H:%M"),
-        })
-        _delivery_log("rsvp_not_going", client_id, event_id, "")
-        await cb.message.answer("Дякуємо! Коли з’являться інші дати — надішлемо.")
-        await cb.answer(); return
-    if action == "rem24":
-        _upsert_rsvp(event_id, client_id, {
-            "rsvp": "remind_me",
-            "remind_24h": "TRUE",
-            "rsvp_at": datetime.now(tz).strftime("%Y-%m-%d %H:%M"),
-        })
-        _delivery_log("rsvp_rem24", client_id, event_id, "")
-        await cb.message.answer("🔔 Гаразд, нагадаю *за 24 год* до старту.")
-        await cb.answer(); return
-
-async def job_reminder_24h():
-    if not _BOT_PHASE3: return
-    try:
-        we = gs().worksheet(SHEET_EVENTS); events = _read_all(we)
-        wr = gs().worksheet(SHEET_RSVP); rsvps = _read_all(wr)
-        wc = gs().worksheet(SHEET_CLIENTS); clients = _read_all(wc)
-        tg_map = {c.get("client_id"): c.get("tg_user_id") for c in clients}
-
-        for ev in events:
-            start = parse_dt_local(ev.get("start_at",""))
-            if not start: continue
-            mins_to = int((start - datetime.now(tz)).total_seconds() // 60)
-            if not (REMINDER24_WINDOW[0] <= mins_to <= REMINDER24_WINDOW[1]):
-                continue
-            targets = [r for r in rsvps
-                       if r.get("event_id")==ev.get("event_id")
-                       and (r.get("rsvp") in ("going","remind_me"))
-                       and str(r.get("remind_24h","")).lower() in ("true","1","yes")
-                       and str(r.get("reminded_24h","")).lower() not in ("true","1","yes")]
-            if not targets: continue
-            title = ev.get("title") or ev.get("type") or "Зустріч"
-            t_str = start.strftime("%H:%M")
-            for r in targets:
-                chat_id = tg_map.get(r.get("client_id"))
-                if not chat_id: continue
-                try:
-                    text = tmpl("reminder.24h","uk") or f"🔔 Нагадуємо: *завтра* о {t_str} відбудеться *{title}*.\nПосилання: {ev.get('link')}"
-                    await _BOT_PHASE3.send_message(int(chat_id), text)
-                    _delivery_log("reminder_24h_sent", r.get("client_id"), ev.get("event_id"), "")
-                    _upsert_rsvp(ev.get("event_id"), r.get("client_id"), {"reminded_24h":"TRUE"})
-                    await asyncio.sleep(0.04)
-                except Exception as e:
-                    _delivery_log("fail", r.get("client_id"), ev.get("event_id"), f"rem24: {e}")
-    except Exception:
-        pass
-
-async def job_reminder_60m():
-    if not _BOT_PHASE3: return
-    try:
-        we = gs().worksheet(SHEET_EVENTS); events = _read_all(we)
-        wr = gs().worksheet(SHEET_RSVP); rsvps = _read_all(wr)
-        wc = gs().worksheet(SHEET_CLIENTS); clients = _read_all(wc)
-        tg_map = {c.get("client_id"): c.get("tg_user_id") for c in clients}
-
-        for ev in events:
-            start = parse_dt_local(ev.get("start_at",""))
-            if not start: continue
-            mins_to = int((start - datetime.now(tz)).total_seconds() // 60)
-            if not (REMINDER60_WINDOW[0] <= mins_to <= REMINDER60_WINDOW[1]):
-                continue
-            targets = [r for r in rsvps
-                       if r.get("event_id")==ev.get("event_id")
-                       and r.get("rsvp")=="going"
-                       and str(r.get("reminded_60m","")).lower() not in ("true","1","yes")]
-            if not targets: continue
-            title = ev.get("title") or ev.get("type") or "Зустріч"
-            for r in targets:
-                chat_id = tg_map.get(r.get("client_id"))
-                if not chat_id: continue
-                try:
-                    text = tmpl("reminder.60m","uk") or f"⏰ Нагадуємо: через 1 год почнеться *{title}*. Посилання: {ev.get('link')}"
-                    await _BOT_PHASE3.send_message(int(chat_id), text)
-                    _delivery_log("reminder_60m_sent", r.get("client_id"), ev.get("event_id"), "")
-                    _upsert_rsvp(ev.get("event_id"), r.get("client_id"), {"reminded_60m":"TRUE"})
-                    await asyncio.sleep(0.04)
-                except Exception as e:
-                    _delivery_log("fail", r.get("client_id"), ev.get("event_id"), f"rem60: {e}")
-    except Exception:
-        pass
-
-def setup_phase3(dp, scheduler=None, bot_instance=None):
-    dp.include_router(phase3_router)
-    if bot_instance is not None:
-        init_phase3(bot_instance)
-    if scheduler is not None:
-        scheduler.add_job(job_broadcast_new, "interval", minutes=1, id="broadcast_new",
-                          replace_existing=True, coalesce=True, misfire_grace_time=30)
-        scheduler.add_job(job_reminder_24h, "interval", minutes=5, id="reminder_24h",
-                          replace_existing=True, coalesce=True, misfire_grace_time=30)
-        scheduler.add_job(job_reminder_60m, "interval", minutes=1, id="reminder_60m",
-                          replace_existing=True, coalesce=True, misfire_grace_time=30)
-
-# ============================== Phase 4: Feedback/Escalation ==================
-
-feedback_router = Router(name="phase4_feedback")
-_FB_BOT = None
-def init_phase4(bot_instance):
-    global _FB_BOT
-    _FB_BOT = bot_instance
-
-def fmt_dt(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d %H:%M")
-
-def _sign(raw: str) -> str:
-    return hmac.new(SECRET_HMAC_KEY.encode(), raw.encode(), hashlib.sha256).hexdigest()[:16]
-
-def _make_cb(kind: str, event_id: str, client_id: str, extra: str = "") -> str:
-    raw = f"{kind}|{event_id}|{client_id}|{extra}"
-    return f"{raw}|{_sign(raw)}"
-
-def _verify_cb(data: str):
-    try:
-        kind, event_id, client_id, extra, sig = data.split("|", 4)
-        raw = f"{kind}|{event_id}|{client_id}|{extra}"
-        return _sign(raw) == sig, {"kind":kind, "event_id":event_id, "client_id":client_id, "extra":extra}
-    except Exception:
-        return False, {}
-
-def _msg_tmpl(key: str, lang="uk") -> Optional[str]:
-    try:
-        ws = gs().worksheet(SHEET_MESSAGES)
-        for r in _read_all(ws):
-            if r.get("key")==key and r.get("lang")==lang:
-                return (r.get("text") or "").strip()
-    except Exception:
-        pass
-    return None
-
-def _feedback_prompt(title: str) -> str:
-    t = _msg_tmpl("feedback.ask","uk")
-    if t:
-        return t.replace("{title}", title)
-    return ("Дякуємо за участь у *{title}*. Оцініть, будь ласка:\n"
-            "1) Корисність: ⭐️1–5\n"
-            "2) Чи зрозумілі наступні кроки? ✅ Так / ⚠️ Частково / ❌ Ні\n"
-            "Можна додати коментар — натисніть кнопку нижче.").replace("{title}", title)
-
-def _get_event(event_id: str) -> Optional[Dict[str,str]]:
-    try:
-        ws = gs().worksheet(SHEET_EVENTS)
-        for r in _read_all(ws):
-            if r.get("event_id")==event_id:
-                return r
-    except Exception:
-        pass
-    return None
-
-def _get_client_by_id(client_id: str) -> Optional[Dict[str,str]]:
-    try:
-        ws = gs().worksheet(SHEET_CLIENTS)
-        for r in _read_all(ws):
-            if r.get("client_id")==client_id:
-                return r
-    except Exception:
-        pass
-    return None
-
-def _upsert_feedback(event_id: str, client_id: str, patch: Dict[str,str]):
-    sh = gs().worksheet(SHEET_FEEDBACK)
-    rows = _find_rows(sh, lambda r: r.get("event_id")==event_id and r.get("client_id")==client_id)
-    if rows:
-        rownum, _ = rows[0]
-        for k, v in patch.items():
-            sh.update_cell(rownum, _col_index(sh, k), v)
-    else:
-        row = {"event_id": event_id, "client_id": client_id,
-               "stars":"", "clarity":"", "comment":"", "submitted_at":"",
-               "followup_needed":"", "handled_at":"", "owner":""}
-        row.update(patch)
-        _append(sh, row)
-
-def _delivery_has_feedback_ask(event_id: str, client_id: str) -> bool:
-    try:
-        ws = gs().worksheet(SHEET_DELIVERY)
-        rows = _read_all(ws)
-        return any(r.get("event_id")==event_id and r.get("client_id")==client_id and r.get("action")=="feedback_ask_sent" for r in rows)
-    except Exception:
-        return False
-
-def _kb_feedback(event_id: str, client_id: str) -> InlineKeyboardMarkup:
-    stars_row = [
-        InlineKeyboardButton(text="⭐ 1", callback_data=_make_cb("fb_star", event_id, client_id, "1")),
-        InlineKeyboardButton(text="⭐ 2", callback_data=_make_cb("fb_star", event_id, client_id, "2")),
-        InlineKeyboardButton(text="⭐ 3", callback_data=_make_cb("fb_star", event_id, client_id, "3")),
-        InlineKeyboardButton(text="⭐ 4", callback_data=_make_cb("fb_star", event_id, client_id, "4")),
-        InlineKeyboardButton(text="⭐ 5", callback_data=_make_cb("fb_star", event_id, client_id, "5")),
-    ]
-    clarity_row = [
-        InlineKeyboardButton(text="✅ Так", callback_data=_make_cb("fb_clr", event_id, client_id, "yes")),
-        InlineKeyboardButton(text="⚠️ Частково", callback_data=_make_cb("fb_clr", event_id, client_id, "partial")),
-        InlineKeyboardButton(text="❌ Ні", callback_data=_make_cb("fb_clr", event_id, client_id, "no")),
-    ]
-    comment_row = [
-        InlineKeyboardButton(text="✍️ Написати відгук", callback_data=_make_cb("fb_cmt", event_id, client_id, "")),
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=[stars_row, clarity_row, comment_row])
-
-async def _escalate_if_needed(event_id: str, client_id: str):
-    if not SUPPORT_CHAT_ID:
+        data["full_name"] = full_name
+        set_state(user.id, "register", "wait_phone", data)
+        await msg.reply_text("Вкажіть номер телефону у форматі 380XXXXXXXXX:")
         return
-    ev = _get_event(event_id) or {}
-    cl = _get_client_by_id(client_id) or {}
-    try:
-        ws = gs().worksheet(SHEET_FEEDBACK)
-        rows = _find_rows(ws, lambda r: r.get("event_id")==event_id and r.get("client_id")==client_id)
-        if not rows:
+
+    if mode == "register" and step == "wait_phone":
+        phone = normalize_phone(msg.text or "")
+        if not phone:
+            await msg.reply_text("Невірний формат. Приклад: 380671234567. Спробуйте ще раз:")
             return
-        _, fb = rows[0]
-        stars = int(fb.get("stars") or "0")
-        clarity = (fb.get("clarity") or "").lower()
-        comment = fb.get("comment") or ""
-        negative = (stars and stars < 4) or (clarity not in ("", "yes"))
-        if not negative:
-            return
-        _upsert_feedback(event_id, client_id, {"followup_needed":"TRUE"})
-        title = ev.get("title") or ev.get("type") or "Зустріч"
-        dt = parse_dt_local(ev.get("start_at",""))
-        dts = dt.strftime("%Y-%m-%d %H:%M") if dt else (ev.get("start_at") or "")
-        text = (
-            f"🚨 *Негативний фідбек*\n"
-            f"• Клієнт: {cl.get('full_name') or '—'} ({cl.get('phone') or '—'})\n"
-            f"• Подія: {title} `{event_id}` ({dts})\n"
-            f"• Оцінка: {stars or '—'} ⭐; Зрозумілість: {clarity or '—'}\n"
-            f"• Коментар: {comment or '—'}"
-        )
-        try:
-            await _FB_BOT.send_message(int(SUPPORT_CHAT_ID), text, parse_mode=ParseMode.MARKDOWN)
-            _delivery_log("feedback_escalated", client_id, event_id, "")
-        except Exception:
-            _delivery_log("fail", client_id, event_id, "feedback_escalation_send_error")
-    except Exception:
-        pass
-
-class FBComment(StatesGroup):
-    waiting = State()
-
-@feedback_router.callback_query(F.data.regexp(r"^fb_cmt\|"))
-async def fb_comment_start(cb: CallbackQuery, state: FSMContext):
-    ok, p = _verify_cb(cb.data)
-    if not ok:
-        await cb.answer("Невірний підпис", show_alert=True); return
-    try:
-        wc = gs().worksheet(SHEET_CLIENTS)
-        me = next((r for r in _read_all(wc) if r.get("tg_user_id")==str(cb.from_user.id)), None)
-        if not me or me.get("client_id") != p["client_id"]:
-            await cb.answer("Недоступно", show_alert=True); return
-    except Exception:
-        await cb.answer("Помилка доступу", show_alert=True); return
-    await state.update_data(event_id=p["event_id"], client_id=p["client_id"])
-    await cb.message.answer("✍️ Напишіть, будь ласка, ваш коментар одним повідомленням.")
-    await state.set_state(FBComment.waiting)
-    await cb.answer()
-
-@feedback_router.message(FBComment.waiting)
-async def fb_comment_save(msg: Message, state: FSMContext):
-    d = await state.get_data()
-    event_id = d.get("event_id"); client_id = d.get("client_id")
-    comment = (msg.text or "").strip()
-    try:
-        _upsert_feedback(event_id, client_id, {"comment": comment, "submitted_at": fmt_dt(datetime.now(tz))})
-        await msg.answer("✅ Дякуємо! Ваш коментар збережено.")
-        await _escalate_if_needed(event_id, client_id)
-    except Exception:
-        await msg.answer("Не вдалося зберегти відгук. Спробуйте пізніше.")
-    finally:
-        await state.clear()
-
-@feedback_router.callback_query(F.data.regexp(r"^fb_star\|"))
-async def fb_set_stars(cb: CallbackQuery):
-    ok, p = _verify_cb(cb.data)
-    if not ok:
-        await cb.answer("Невірний підпис", show_alert=True); return
-    try:
-        wc = gs().worksheet(SHEET_CLIENTS)
-        me = next((r for r in _read_all(wc) if r.get("tg_user_id")==str(cb.from_user.id)), None)
-        if not me or me.get("client_id") != p["client_id"]:
-            await cb.answer("Недоступно", show_alert=True); return
-    except Exception:
-        await cb.answer("Помилка доступу", show_alert=True); return
-
-    stars = p["extra"]
-    try:
-        _upsert_feedback(p["event_id"], p["client_id"], {"stars": stars, "submitted_at": fmt_dt(datetime.now(tz))})
-        await cb.message.answer(f"⭐ Дякуємо! Оцінка: *{stars}*.")
-        await _escalate_if_needed(p["event_id"], p["client_id"])
-    except Exception:
-        await cb.message.answer("Не вдалося зберегти оцінку.")
-    await cb.answer()
-
-@feedback_router.callback_query(F.data.regexp(r"^fb_clr\|"))
-async def fb_set_clarity(cb: CallbackQuery):
-    ok, p = _verify_cb(cb.data)
-    if not ok:
-        await cb.answer("Невірний підпис", show_alert=True); return
-    try:
-        wc = gs().worksheet(SHEET_CLIENTS)
-        me = next((r for r in _read_all(wc) if r.get("tg_user_id")==str(cb.from_user.id)), None)
-        if not me or me.get("client_id") != p["client_id"]:
-            await cb.answer("Недоступно", show_alert=True); return
-    except Exception:
-        await cb.answer("Помилка доступу", show_alert=True); return
-
-    clarity = p["extra"]
-    try:
-        _upsert_feedback(p["event_id"], p["client_id"], {"clarity": clarity, "submitted_at": fmt_dt(datetime.now(tz))})
-        pretty = {"yes":"✅ Так", "partial":"⚠️ Частково", "no":"❌ Ні"}.get(clarity, clarity)
-        await cb.message.answer(f"🧭 Зрозумілість: {pretty}. Дякуємо!")
-        await _escalate_if_needed(p["event_id"], p["client_id"])
-    except Exception:
-        await cb.message.answer("Не вдалося зберегти відповідь.")
-    await cb.answer()
-
-FEEDBACK_WINDOW_MIN = (175, 205)
-def parse_dt_local_fb(s: str) -> Optional[datetime]:
-    return parse_dt_local(s)
-
-async def job_feedback_ask():
-    if not _FB_BOT:
+        cli = upsert_client(user.id, data["full_name"], phone)
+        clear_state(user.id)
+        await send_welcome_and_types_list(update, context, cli)
         return
-    try:
-        we = gs().worksheet(SHEET_EVENTS); events = _read_all(we)
-        wr = gs().worksheet(SHEET_RSVP);   rsvps  = _read_all(wr)
-        wc = gs().worksheet(SHEET_CLIENTS);clients = _read_all(wc)
-        tg_map = {c.get("client_id"): c.get("tg_user_id") for c in clients}
 
-        for ev in events:
-            start = parse_dt_local_fb(ev.get("start_at","")); 
-            if not start: continue
+    # Адмін: майстер створення — редагування титулу/опису/дат/тривалості/лінку
+    if mode == "admin_add":
+        if step == "await_title":
+            data["title"] = (msg.text or "").strip()
+            set_state(user.id, "admin_add", "menu", data)
+            await msg.reply_text(f"Назву оновлено.\n\nПоточні дані:\n• Тип: {data['type_title']}\n• Назва: {data['title']}\n• Опис: {data['description']}\n\nНатисніть «➡️ Далі» або змініть інше поле.",
+                                 reply_markup=InlineKeyboardMarkup([
+                                     [InlineKeyboardButton("✏️ Змінити назву", callback_data="admin:add:edit_title")],
+                                     [InlineKeyboardButton("✏️ Змінити опис", callback_data="admin:add:edit_desc")],
+                                     [InlineKeyboardButton("➡️ Далі", callback_data="admin:add:next")]
+                                 ]))
+            return
+        if step == "await_desc":
+            data["description"] = (msg.text or "").strip()
+            set_state(user.id, "admin_add", "menu", data)
+            await msg.reply_text(f"Опис оновлено.\n\nПоточні дані:\n• Тип: {data['type_title']}\n• Назва: {data['title']}\n• Опис: {data['description']}\n\nНатисніть «➡️ Далі» або змініть інше поле.",
+                                 reply_markup=InlineKeyboardMarkup([
+                                     [InlineKeyboardButton("✏️ Змінити назву", callback_data="admin:add:edit_title")],
+                                     [InlineKeyboardButton("✏️ Змінити опис", callback_data="admin:add:edit_desc")],
+                                     [InlineKeyboardButton("➡️ Далі", callback_data="admin:add:next")]
+                                 ]))
+            return
+        if step == "await_start_at":
+            dt = parse_dt(msg.text or "")
+            if not dt:
+                await msg.reply_text("Невірний формат. Приклад: 2025-10-05 15:00 (Київ). Спробуйте ще раз:")
+                return
+            data["start_at"] = iso_dt(dt)
+            set_state(user.id, "admin_add", "await_duration", data)
+            await msg.reply_text("Вкажіть тривалість у хвилинах (ціле число):")
+            return
+        if step == "await_duration":
             try:
-                dur = int(ev.get("duration_min") or "60")
+                dur = int((msg.text or "").strip())
+                if dur <= 0:
+                    raise ValueError()
             except Exception:
-                dur = 60
-            end_dt = start + timedelta(minutes=dur)
-            mins_after = int((datetime.now(tz) - end_dt).total_seconds() // 60)
+                await msg.reply_text("Вкажіть додатне ціле число хвилин. Спробуйте ще раз:")
+                return
+            data["duration_min"] = dur
+            set_state(user.id, "admin_add", "await_link", data)
+            await msg.reply_text("Вставте посилання на конференцію (URL):")
+            return
+        if step == "await_link":
+            link = (msg.text or "").strip()
+            data["link"] = link
+            # створення події
+            created = create_event(
+                type_code=int(data["type_code"]),
+                title=data["title"],
+                description=data["description"],
+                start_at=data["start_at"],
+                duration_min=int(data["duration_min"]),
+                link=data["link"],
+                created_by=f"admin:{user.id}"
+            )
+            clear_state(user.id)
+            await msg.reply_text(
+                f"✅ Подію створено:\n"
+                f"• {created['title']}\n"
+                f"• Дата/час: {created['start_at']} (Київ)\n"
+                f"• Тривалість: {created['duration_min']} хв\n"
+                f"• Посилання: {created['link']}\n",
+                reply_markup=kb_admin_main()
+            )
+            return
 
-            if not (FEEDBACK_WINDOW_MIN[0] <= mins_after <= FEEDBACK_WINDOW_MIN[1]):
-                continue
+    if mode == "admin_edit_field":
+        event_id = data.get("event_id")
+        field = data.get("field")
+        if field in {"title", "description", "link"}:
+            val = (msg.text or "").strip()
+            update_event_field(event_id, field, val)
+            await msg.reply_text("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
+            clear_state(user.id)
+            # повідомлення учасникам про оновлення (якщо треба)
+            await notify_event_update(context, event_id, f"Змінено поле: {field}")
+            return
+        elif field == "start_at":
+            dt = parse_dt(msg.text or "")
+            if not dt:
+                await msg.reply_text("Невірний формат. Приклад: 2025-10-05 15:00. Спробуйте ще раз:")
+                return
+            update_event_field(event_id, "start_at", iso_dt(dt))
+            await msg.reply_text("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
+            clear_state(user.id)
+            await notify_event_update(context, event_id, "Змінено дату/час")
+            return
+        elif field == "duration_min":
+            try:
+                dur = int((msg.text or "").strip())
+                if dur <= 0:
+                    raise ValueError()
+            except Exception:
+                await msg.reply_text("Введіть додатне ціле число. Спробуйте ще раз:")
+                return
+            update_event_field(event_id, "duration_min", dur)
+            await msg.reply_text("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
+            clear_state(user.id)
+            await notify_event_update(context, event_id, "Змінено тривалість")
+            return
 
-            eid = ev.get("event_id")
-            title = ev.get("title") or ev.get("type") or "Зустріч"
-            candidates = [r for r in rsvps if r.get("event_id")==eid and r.get("rsvp")=="going"]
+    if mode == "feedback_comment":
+        event_id = data.get("event_id")
+        client_id = data.get("client_id")
+        stars = int(data.get("stars", 0))
+        comment = (msg.text or "").strip()
+        feedback_save(event_id, client_id, stars, comment)
+        clear_state(user.id)
+        await msg.reply_text("Дякуємо! Відгук збережено.")
+        if stars < 4:
+            await route_low_feedback(context, event_id, client_id, stars, comment)
+        return
 
-            for r in candidates:
-                cid = r.get("client_id")
-                chat_id = tg_map.get(cid)
-                if not chat_id:
-                    continue
-                if _delivery_has_feedback_ask(eid, cid) or _find_rows(gs().worksheet(SHEET_FEEDBACK),
-                    lambda rr: rr.get("event_id")==eid and rr.get("client_id")==cid):
-                    continue
+# ============================== CALLBACKS =====================================
 
-                text = _feedback_prompt(title)
-                kb = _kb_feedback(eid, cid)
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    data = query.data or ""
+    await query.answer()
+
+    # Адмін навігація
+    if data == "admin:add":
+        if not is_admin(user.id):
+            return
+        # Показ списку типів (за тайтлами)
+        types = get_eventtypes_active()
+        if not types:
+            await query.edit_message_text("Немає активних типів конференцій.", reply_markup=kb_admin_main())
+            return
+        buttons = [[InlineKeyboardButton(t["title"], callback_data=f"admin:add:type:{t['type_code']}")] for t in types]
+        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:home")])
+        await query.edit_message_text("Оберіть тип конференції:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("admin:add:type:"):
+        if not is_admin(user.id):
+            return
+        type_code = int(data.split(":")[-1])
+        et = get_eventtype_by_code(type_code)
+        if not et:
+            await query.edit_message_text("Тип не знайдено.", reply_markup=kb_admin_main())
+            return
+        st = {
+            "type_code": type_code,
+            "type_title": et["title"],
+            "title": et["title"],
+            "description": et["description"],
+        }
+        set_state(user.id, "admin_add", "menu", st)
+        await query.edit_message_text(
+            f"Базові дані підставлено з довідника:\n"
+            f"• Тип: {st['type_title']}\n• Назва: {st['title']}\n• Опис: {st['description']}\n\n"
+            f"Можете підправити та натиснути «➡️ Далі».",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Змінити назву", callback_data="admin:add:edit_title")],
+                [InlineKeyboardButton("✏️ Змінити опис", callback_data="admin:add:edit_desc")],
+                [InlineKeyboardButton("➡️ Далі", callback_data="admin:add:next")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="admin:home")],
+            ])
+        )
+        return
+
+    if data == "admin:add:edit_title":
+        set_state(user.id, "admin_add", "await_title", USER_STATE[user.id]["data"])
+        await query.edit_message_text("Надішліть нову назву конференції:")
+        return
+
+    if data == "admin:add:edit_desc":
+        set_state(user.id, "admin_add", "await_desc", USER_STATE[user.id]["data"])
+        await query.edit_message_text("Надішліть новий опис конференції:")
+        return
+
+    if data == "admin:add:next":
+        _, step, st = get_state(user.id)
+        if not st:
+            await query.edit_message_text("Сесію створення перервано. Спробуйте ще раз.", reply_markup=kb_admin_main())
+            return
+        set_state(user.id, "admin_add", "await_start_at", st)
+        await query.edit_message_text("Вкажіть дату та час початку у форматі: YYYY-MM-DD HH:MM (Київ). Напр.: 2025-10-05 15:00")
+        return
+
+    if data.startswith("admin:list:"):
+        if not is_admin(user.id):
+            return
+        page = int(data.split(":")[-1])
+        events = list_future_events_sorted()
+        per = 10
+        total = len(events)
+        start = page * per
+        end = start + per
+        subset = events[start:end]
+        if not subset and page != 0:
+            page = 0
+            start, end = 0, per
+            subset = events[start:end]
+        buttons = []
+        for e in subset:
+            dt = event_start_dt(e)
+            dt_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "—"
+            buttons.append([InlineKeyboardButton(f"{e['title']} — {dt_str}", callback_data=f"admin:event:{e['event_id']}")])
+        nav = []
+        if start > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"admin:list:{page-1}"))
+        if end < total:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"admin:list:{page+1}"))
+        buttons.append(nav or [InlineKeyboardButton("—", callback_data="noop")])
+        buttons.append([InlineKeyboardButton("🏠 Головне меню", callback_data="admin:home")])
+        await query.edit_message_text(f"Список конференцій (усього: {total}):", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data == "admin:home":
+        if not is_admin(user.id):
+            return
+        await query.edit_message_text("Адмін-панель:", reply_markup=kb_admin_main())
+        return
+
+    if data.startswith("admin:event:") and data.count(":") == 2:
+        if not is_admin(user.id):
+            return
+        event_id = data.split(":")[-1]
+        e = get_event_by_id(event_id)
+        if not e:
+            await query.edit_message_text("Подію не знайдено.", reply_markup=kb_admin_main())
+            return
+        await query.edit_message_text(
+            f"Подія:\n• {e['title']}\n• Опис: {e['description']}\n• Початок: {e['start_at']}\n"
+            f"• Тривалість: {e['duration_min']} хв\n• Посилання: {e['link']}",
+            reply_markup=kb_event_actions(event_id)
+        )
+        return
+
+    if data.startswith("admin:edit:") and data.count(":") == 2:
+        if not is_admin(user.id):
+            return
+        event_id = data.split(":")[-1]
+        await query.edit_message_text("Оберіть поле для редагування:", reply_markup=kb_edit_event_menu(event_id))
+        return
+
+    if data.startswith("admin:edit:") and data.count(":") == 4 and ":field:" in data:
+        if not is_admin(user.id):
+            return
+        _, _, event_id, _, field = data.split(":")
+        set_state(user.id, "admin_edit_field", "await", {"event_id": event_id, "field": field})
+        prompts = {
+            "title": "Введіть нову назву:",
+            "description": "Введіть новий опис:",
+            "start_at": "Введіть нову дату/час у форматі YYYY-MM-DD HH:MM:",
+            "duration_min": "Введіть нову тривалість у хвилинах:",
+            "link": "Вставте нове посилання на конференцію:",
+        }
+        await query.edit_message_text(prompts.get(field, "Введіть значення:"))
+        return
+
+    if data.startswith("admin:cancel:") and data.count(":") == 2:
+        if not is_admin(user.id):
+            return
+        event_id = data.split(":")[-1]
+        await query.edit_message_text("Підтвердити скасування події?", reply_markup=kb_cancel_confirm(event_id))
+        return
+
+    if data.startswith("admin:cancel:") and data.endswith(":yes"):
+        if not is_admin(user.id):
+            return
+        event_id = data.split(":")[2]
+        # повідомляємо учасникам з RSVP=going
+        await notify_event_cancel(context, event_id)
+        delete_event(event_id)
+        await query.edit_message_text("✅ Подію скасовано та видалено.", reply_markup=kb_admin_main())
+        return
+
+    # Клієнтські RSVP
+    if data.startswith("rsvp:"):
+        _, event_id, action = data.split(":")
+        cli = get_client_by_tg(user.id)
+        if not cli:
+            await query.edit_message_text("Будь ласка, зареєструйтесь командою /start.")
+            return
+        client_id = cli["client_id"]
+        event = get_event_by_id(event_id)
+        if not event:
+            await query.edit_message_text("Подію не знайдено.")
+            return
+
+        if action == "going":
+            rsvp_upsert(event_id, client_id, rsvp="going")
+            # Фіксуємо відвідування як attended=1 (для логіки відміток та фідбеку)
+            mark_attendance(event_id, client_id, 1)
+            log_action("rsvp_yes", client_id=client_id, event_id=event_id, details="")
+            await query.edit_message_text("Дякуємо! Участь підтверджено ✅")
+            return
+
+        if action == "declined":
+            rsvp_upsert(event_id, client_id, rsvp="declined")
+            log_action("rsvp_no", client_id=client_id, event_id=event_id, details="")
+            # пропонуємо альтернативи цього самого типу
+            alt = list_alternative_events_same_type(a2i(event.get("type")), event_id)
+            if not alt:
+                await query.edit_message_text("Добре! Тоді очікуйте нове запрошення на іншу дату.")
+            else:
+                btns = [[InlineKeyboardButton(f"{a['title']} — {a['start_at']}", callback_data="noop")] for a in alt]
+                await query.edit_message_text("Можливі альтернативи:", reply_markup=InlineKeyboardMarkup(btns))
+            return
+
+        if action == "remind":
+            rsvp_upsert(event_id, client_id, rsvp="remind_24h", remind_24h=1)
+            log_action("rsvp_remind_24h", client_id=client_id, event_id=event_id, details="")
+            await query.edit_message_text("Гаразд! Нагадаємо за 24 години 🔔")
+            return
+
+    # Претензію взято у роботу (низький відгук)
+    if data.startswith("claim:"):
+        _, event_id, client_id = data.split(":")
+        owner = f"@{update.effective_user.username}" if update.effective_user and update.effective_user.username else f"id:{update.effective_user.id}"
+        feedback_assign_owner(event_id, client_id, owner)
+        log_action("complaint_taken", client_id=client_id, event_id=event_id, details=f"owner={owner}")
+        await query.edit_message_text(f"✅ Взято в роботу ({owner})")
+        return
+
+# ================================= NOTIFY =====================================
+
+async def notify_event_update(context: ContextTypes.DEFAULT_TYPE, event_id: str, what: str):
+    # Розсилка оновлення тим, хто RSVP=going
+    event = get_event_by_id(event_id)
+    if not event:
+        return
+    templ = messages_get("update.notice")
+    body = templ.format(title=event["title"], what=what)
+    # пробігаємо по RSVP
+    for r in rsvp_get_for_event(event_id):
+        if str(r.get("rsvp")) == "going":
+            tg_id = try_get_tg_from_client_id(r.get("client_id"))
+            if tg_id:
                 try:
-                    await _FB_BOT.send_message(int(chat_id), text, reply_markup=kb)
-                    _delivery_log("feedback_ask_sent", cid, eid, "")
-                    await asyncio.sleep(0.04)
-                except Exception as e:
-                    _delivery_log("fail", cid, eid, f"feedback_ask: {e}")
-    except Exception:
-        pass
+                    await context.bot.send_message(chat_id=int(tg_id), text=body)
+                except Exception:
+                    pass
 
-def setup_phase4(dp, scheduler=None, bot_instance=None):
-    dp.include_router(feedback_router)
-    if bot_instance is not None:
-        init_phase4(bot_instance)
-    if scheduler is not None:
-        scheduler.add_job(job_feedback_ask, "interval", minutes=5, id="feedback_ask",
-                          replace_existing=True, coalesce=True, misfire_grace_time=30)
+async def notify_event_cancel(context: ContextTypes.DEFAULT_TYPE, event_id: str):
+    event = get_event_by_id(event_id)
+    if not event:
+        return
+    templ = messages_get("cancel.notice")
+    body = templ.format(title=event["title"])
+    for r in rsvp_get_for_event(event_id):
+        if str(r.get("rsvp")) == "going":
+            tg_id = try_get_tg_from_client_id(r.get("client_id"))
+            if tg_id:
+                try:
+                    await context.bot.send_message(chat_id=int(tg_id), text=body)
+                except Exception:
+                    pass
 
-# ============================== Phase 5: Polish (/help, quiet hours opt-in) ===
-
-phase5_router = Router(name="phase5")
-
-# прості шаблони повідомлень із Messages з fallback
-def _messages_get(key: str, lang: str="uk") -> Optional[str]:
-    try:
-        ws = gs().worksheet(SHEET_MESSAGES)
-        for r in _read_all(ws):
-            if r.get("key")==key and (r.get("lang") or "uk")==lang:
-                return r.get("text") or ""
-    except Exception:
-        pass
+def try_get_tg_from_client_id(client_id: str) -> Optional[int]:
+    w = ws(SHEET_CLIENTS)
+    rows = get_all_records(w)
+    for r in rows:
+        if str(r.get("client_id")) == str(client_id):
+            return int(r.get("tg_user_id"))
     return None
 
-_FALLBACKS = {
-    "help.body": (
-        "👋 Це бот для запрошень на наші онлайн-зустрічі.\n\n"
-        "Ви отримуватимете інвайти та нагадування. Кнопки під повідомленням:\n"
-        "• ✅ Так, буду — підтвердити участь (ми нагадаємо за 24 год і за 1 год)\n"
-        "• 🚫 Не зможу — пропустити цю дату (ми запропонуємо іншу)\n"
-        "• 🔔 Нагадати за 24 год — якщо ще не вирішили\n\n"
-        "Питання? Напишіть нам у відповідь, ми допоможемо 💬"
-    ),
-}
-
-def msg_text(key: str, lang="uk", **fmt) -> str:
-    txt = _messages_get(key, lang) or _FALLBACKS.get(key, "")
-    for k,v in fmt.items():
-        txt = txt.replace("{"+k+"}", str(v))
-    return txt
-
-@phase5_router.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer(msg_text("help.body"))
-
-@phase5_router.message(Command("profile"))
-async def cmd_profile(message: Message):
+async def route_low_feedback(context: ContextTypes.DEFAULT_TYPE, event_id: str, client_id: str, stars: int, comment: str):
+    # повідомлення в чат підтримки з кнопкою «Беру в роботу»
+    cli_tg = try_get_tg_from_client_id(client_id)
+    cli_row = get_client_by_tg(cli_tg) if cli_tg else None
+    full_name = cli_row["full_name"] if cli_row else client_id
+    phone = cli_row["phone"] if cli_row else "—"
+    event = get_event_by_id(event_id) or {}
+    text = (
+        f"⚠️ Низька оцінка події\n"
+        f"• Подія: {event.get('title','')}\n"
+        f"• Клієнт: {full_name} (tg_id={cli_tg})\n"
+        f"• Телефон: {phone}\n"
+        f"• Оцінка: {stars}\n"
+        f"• Коментар: {comment or '—'}"
+    )
     try:
-        ws = gs().worksheet(SHEET_CLIENTS)
-        me = next((r for r in _read_all(ws) if r.get("tg_user_id")==str(message.from_user.id)), None)
-        if not me:
-            await message.answer("Ще не бачу ваших даних. Надішліть /start, щоб зареєструватися.")
-            return
-        txt = (
-            "📇 *Ваш профіль:*\n"
-            f"• ПІБ: {me.get('full_name') or '—'}\n"
-            f"• Телефон: {me.get('phone') or '—'}\n"
-            f"• Статус: {me.get('status') or '—'}"
-        )
-        await message.answer(txt)
+        await context.bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text,
+                                       reply_markup=kb_claim_feedback(event_id, client_id))
     except Exception:
-        await message.answer("Не вдалося отримати дані профілю.")
+        pass
 
-# ============================== Wiring & Run ==================================
+# =============================== SCHEDULER ====================================
+
+async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
+    now = now_kyiv()
+    # 1) INVITES (-24h) -> усім активним, хто ще не був на типі
+    for e in list_future_events_sorted():
+        dt = event_start_dt(e)
+        if not dt:
+            continue
+        # Вікно для відправки інвайтів: коли настав момент -24h (±60с)
+        diff = (dt - now).total_seconds()
+        if 0 <= diff <= 60 + 5 or (24*3600 - 60) <= diff <= (24*3600 + 60):
+            # (покриваємо обидва варіанти у випадку дрібних зсувів)
+            # аудиторія
+            type_code = a2i(e.get("type"))
+            for cli in list_active_clients():
+                cid = cli.get("client_id")
+                tg_id = cli.get("tg_user_id")
+                if not cid or not tg_id:
+                    continue
+                # пропускаємо, якщо вже був на цьому типі
+                if client_has_attended_type(cid, type_code):
+                    continue
+                # не дублюємо інвайт
+                if has_log("invite_sent", cid, e["event_id"]):
+                    continue
+                # надсилаємо інвайт
+                title = e["title"]
+                descr = e["description"]
+                body = messages_get("invite.body").format(
+                    name=cli.get("full_name","Клієнт"),
+                    title=title,
+                    date=fmt_date(dt),
+                    time=fmt_time(dt),
+                    description=descr
+                )
+                try:
+                    await context.bot.send_message(chat_id=int(tg_id),
+                                                   text=messages_get("invite.title").format(title=title))
+                    await context.bot.send_message(chat_id=int(tg_id), text=body,
+                                                   reply_markup=kb_rsvp(e["event_id"]))
+                    log_action("invite_sent", client_id=cid, event_id=e["event_id"], details="")
+                except Exception:
+                    pass
+
+        # 2) REMINDER -24h: тим, хто going або обрав remind_24h (щоб не плутатись з інвайтом — перевіряємо прапор reminded_24h)
+        if 24*3600 - 60 <= diff <= 24*3600 + 60:
+            for r in rsvp_get_for_event(e["event_id"]):
+                cid = r.get("client_id")
+                tg_id = try_get_tg_from_client_id(cid)
+                if not tg_id:
+                    continue
+                if a2i(r.get("reminded_24h"), 0) == 1:
+                    continue
+                if str(r.get("rsvp")) in {"going", "remind_24h"}:
+                    body = messages_get("reminder.24h").format(title=e["title"], time=fmt_time(dt), link=e["link"])
+                    try:
+                        await context.bot.send_message(chat_id=int(tg_id), text=body)
+                        rsvp_upsert(e["event_id"], cid, reminded_24h=1)
+                        log_action("remind_24h_sent", client_id=cid, event_id=e["event_id"], details="")
+                    except Exception:
+                        pass
+
+        # 3) REMINDER -60m: тим, хто going
+        if 60*60 - 60 <= diff <= 60*60 + 60:
+            for r in rsvp_get_for_event(e["event_id"]):
+                cid = r.get("client_id")
+                tg_id = try_get_tg_from_client_id(cid)
+                if not tg_id:
+                    continue
+                if a2i(r.get("reminded_60m"), 0) == 1:
+                    continue
+                if str(r.get("rsvp")) == "going":
+                    body = messages_get("reminder.60m").format(title=e["title"], link=e["link"])
+                    try:
+                        await context.bot.send_message(chat_id=int(tg_id), text=body)
+                        rsvp_upsert(e["event_id"], cid, reminded_60m=1)
+                        log_action("remind_60m_sent", client_id=cid, event_id=e["event_id"], details="")
+                    except Exception:
+                        pass
+
+        # 4) FEEDBACK +3h: тим, хто attended=1
+        if -60 <= (now - dt - timedelta(hours=3)).total_seconds() <= 60:
+            # збираємо фідбек лише раз
+            if has_log("feedback_requested", client_id="", event_id=e["event_id"]):
+                continue
+            w_att = ws(SHEET_ATTEND)
+            rows_att = get_all_records(w_att)
+            for r in rows_att:
+                if str(r.get("event_id")) == e["event_id"] and a2i(r.get("attended")) == 1:
+                    cid = r.get("client_id")
+                    tg_id = try_get_tg_from_client_id(cid)
+                    if not tg_id:
+                        continue
+                    text = messages_get("feedback.ask").format(title=e["title"])
+                    # кнопки зі зірками 1..5 + комент
+                    kb = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("⭐️1", callback_data=f"fb:{e['event_id']}:{cid}:1"),
+                            InlineKeyboardButton("⭐️2", callback_data=f"fb:{e['event_id']}:{cid}:2"),
+                            InlineKeyboardButton("⭐️3", callback_data=f"fb:{e['event_id']}:{cid}:3"),
+                            InlineKeyboardButton("⭐️4", callback_data=f"fb:{e['event_id']}:{cid}:4"),
+                            InlineKeyboardButton("⭐️5", callback_data=f"fb:{e['event_id']}:{cid}:5"),
+                        ],
+                        [InlineKeyboardButton("✍️ Написати відгук", callback_data=f"fb:comment:{e['event_id']}:{cid}")]
+                    ])
+                    try:
+                        await context.bot.send_message(chat_id=int(tg_id), text=text, reply_markup=kb)
+                    except Exception:
+                        pass
+            log_action("feedback_requested", client_id="", event_id=e["event_id"], details="")
+
+async def feedback_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    # fb:<event_id>:<client_id>:<stars>
+    if data.startswith("fb:") and data.count(":") == 3:
+        _, event_id, client_id, stars = data.split(":")
+        stars = int(stars)
+        feedback_save(event_id, client_id, stars, "")
+        await query.edit_message_text(f"Дякуємо! Оцінка {stars}⭐️ збережена.")
+        if stars < 4:
+            await route_low_feedback(context, event_id, client_id, stars, "")
+        return
+
+    # fb:comment:<event_id>:<client_id>
+    if data.startswith("fb:comment:"):
+        _, _, event_id, client_id = data.split(":")
+        # шукаємо tg користувача
+        tg_id = try_get_tg_from_client_id(client_id)
+        if not tg_id or not update.effective_user or update.effective_user.id != int(tg_id):
+            await query.edit_message_text("Введіть коментар у приватному діалозі з ботом.")
+            return
+        set_state(tg_id, "feedback_comment", "await", {"event_id": event_id, "client_id": client_id, "stars": 0})
+        await query.edit_message_text("Надішліть, будь ласка, текстовий відгук повідомленням.")
+        return
+
+# ================================ MAIN ========================================
+
+async def post_init(app):
+    # Планувальник: 1 раз на 60 секунд
+    app.job_queue.run_repeating(scheduler_tick, interval=60, first=5)
 
 def main():
-    # Підключаємо роутери
-    dp.include_router(onboarding_router)   # /start + онбординг
-    dp.include_router(admin_router)        # адмін-панель
-    setup_phase3(dp, None, bot)            # Фаза 3 (router + scheduler нижче)
-    setup_phase4(dp, None, bot)            # Фаза 4 (router + scheduler нижче)
-    dp.include_router(phase5_router)       # /help, /profile
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # Планувальник
-    scheduler = AsyncIOScheduler(
-        timezone=TIMEZONE,
-        job_defaults={"coalesce": True, "misfire_grace_time": 30}
-    )
-    scheduler.add_job(job_broadcast_new, "interval", minutes=1, id="broadcast_new", replace_existing=True)
-    scheduler.add_job(job_reminder_24h, "interval", minutes=5, id="reminder_24h", replace_existing=True)
-    scheduler.add_job(job_reminder_60m, "interval", minutes=1, id="reminder_60m", replace_existing=True)
-    scheduler.add_job(job_feedback_ask, "interval", minutes=5, id="feedback_ask", replace_existing=True)
-    scheduler.start()
+    # commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
 
-    # Старт поллінгу
-    asyncio.run(dp.start_polling(bot))
+    # callbacks
+    app.add_handler(CallbackQueryHandler(callbacks, pattern="^(admin:|rsvp:|claim:|noop$)"))
+    app.add_handler(CallbackQueryHandler(feedback_callbacks, pattern="^(fb:)"))
+
+    # text messages (states)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
+```
