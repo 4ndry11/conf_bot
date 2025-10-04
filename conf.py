@@ -338,6 +338,34 @@ def mark_attendance(event_id: str, client_id: str, attended: int = 1) -> None:
         append_dict(w, payload)
     log_action("attendance_marked", client_id=client_id, event_id=event_id, details=f"attended={attended}")
 
+def attendance_clear_for_event(event_id: str, mode: str = "zero") -> int:
+    """
+    mode="zero"  — проставить attended=0 всем по этому event_id (и обновить marked_at)
+    mode="delete" — удалить строки Attendance для этого event_id
+    Возвращает количество затронутых строк.
+    """
+    w = ws(SHEET_ATTEND)
+    rows = get_all_records(w)
+    touched = 0
+
+    if mode == "delete":
+        # соберём индексы и удалим снизу, чтобы не сдвигались
+        idxs = [i for i, r in enumerate(rows, start=2) if str(r.get("event_id")) == event_id]
+        for i in reversed(idxs):
+            delete_row(w, i)
+            touched += 1
+    else:
+        # zero: ставим attended=0
+        for i, r in enumerate(rows, start=2):
+            if str(r.get("event_id")) == event_id:
+                update_cell(w, i, "attended", 0)
+                update_cell(w, i, "marked_at", iso_dt())
+                touched += 1
+
+    log_action("attendance_cleared_on_cancel", client_id="", event_id=event_id, details=f"mode={mode}; rows={touched}")
+    return touched
+
+
 def client_has_attended_type(client_id: str, type_code: int) -> bool:
     events_by_id = {e.get("event_id"): e for e in get_all_events()}
     w = ws(SHEET_ATTEND)
@@ -840,11 +868,16 @@ async def admin_cancel(q: CallbackQuery):
         return
     if len(parts) == 4 and parts[-1] == "yes":
         event_id = parts[2]
+        # 1) уведомляем участников
         await notify_event_cancel(event_id)
+        # 2) чистим Attendance (ставим attended=0) — можно mode="delete", если хочешь удалять строки полностью
+        attendance_clear_for_event(event_id, mode="zero")
+        # 3) удаляем сам ивент
         delete_event(event_id)
-        await q.message.edit_text("✅ Подію скасовано та видалено.", reply_markup=kb_admin_main())
+        await q.message.edit_text("✅ Подію скасовано, відмітки відвідування скинуто.", reply_markup=kb_admin_main())
         await q.answer()
         return
+
 
 # ---------- RSVP ----------
 
