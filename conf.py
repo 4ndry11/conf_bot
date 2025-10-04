@@ -1,26 +1,27 @@
 # -*- coding: utf-8 -*-
-
 import os
 import re
 import uuid
-import json
 import asyncio
-from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import gspread
 from gspread.utils import rowcol_to_a1
-from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity
-)
-from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, JobQueue
-)
 
-# =============================== CONFIG ======================================
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+)
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+
+# =============================== CONFIG =======================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -31,10 +32,9 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "f7T9vQ1111wLp2Gx8Z")
 SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "Conference ZVILNYMO")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
 GOOGLE_SA_PATH = os.getenv("GOOGLE_SA_PATH", "/etc/secrets/gsheets.json")
-
 TZ = ZoneInfo(TIMEZONE)
 
-# =========================== SHEETS CONNECTION ================================
+# =========================== SHEETS CONNECTION =================================
 
 def _open_gsheet() -> gspread.Spreadsheet:
     if not os.path.exists(GOOGLE_SA_PATH):
@@ -75,7 +75,9 @@ def append_dict(w: gspread.Worksheet, data: Dict[str, Any]) -> None:
 def update_row_dict(w: gspread.Worksheet, row_idx: int, data: Dict[str, Any]) -> None:
     headers = ws_headers(w)
     row = [str(data.get(h, "")) if data.get(h, "") is not None else "" for h in headers]
-    rng = f"A{row_idx}:{rowcol_to_a1(1, len(headers))[:-1]}{row_idx}"
+    start_a1 = rowcol_to_a1(row_idx, 1)
+    end_a1 = rowcol_to_a1(row_idx, len(headers))
+    rng = f"{start_a1}:{end_a1}"
     w.update(rng, [row], value_input_option="USER_ENTERED")
 
 def update_cell(w: gspread.Worksheet, row_idx: int, column_name: str, value: Any) -> None:
@@ -83,13 +85,13 @@ def update_cell(w: gspread.Worksheet, row_idx: int, column_name: str, value: Any
     if column_name not in headers:
         return
     col_idx = headers.index(column_name) + 1
-    a1 = f"{rowcol_to_a1(row_idx, col_idx)}"
+    a1 = rowcol_to_a1(row_idx, col_idx)
     w.update(a1, str(value) if value is not None else "", value_input_option="USER_ENTERED")
 
 def delete_row(w: gspread.Worksheet, row_idx: int) -> None:
     w.delete_rows(row_idx)
 
-# =============================== HELPERS ======================================
+# =============================== HELPERS =======================================
 
 def now_kyiv() -> datetime:
     return datetime.now(TZ)
@@ -131,9 +133,8 @@ def a2i(v: Any, default: int = 0) -> int:
     except Exception:
         return default
 
-# =========================== DOMAIN READ/WRITE ================================
+# =============================== SHEET NAMES ===================================
 
-# Sheets names (fixed by spec)
 SHEET_EVENTTYPES = "EventTypes"
 SHEET_CLIENTS    = "Clients"
 SHEET_EVENTS     = "Events"
@@ -142,6 +143,8 @@ SHEET_LOG        = "DeliveryLog"
 SHEET_FEEDBACK   = "Feedback"
 SHEET_MSG        = "Messages"
 SHEET_RSVP       = "RSVP"
+
+# =============================== DOMAIN LAYER ==================================
 
 def messages_get(key: str, lang: str = "uk") -> str:
     try:
@@ -152,16 +155,15 @@ def messages_get(key: str, lang: str = "uk") -> str:
                 return str(r.get("text", "")).replace("\\n", "\n")
     except Exception:
         pass
-    # fallback невеликий, щоби не падати
     FALLBACKS = {
         "invite.title": "Запрошення на зустріч: {title}",
-        "invite.body": "{name}, запрошуємо на зустріч: {title}\n🗓 {date} о {time} (Київ)\nℹ️ {description}\nОберіть варіант нижче:",
+        "invite.body": "{name}, запрошуємо на зустріч: {title}\n🗓 {date} о {time} (Київ)\nℹ️ {description}\nВиберіть варіант нижче:\n[✅ Так, буду] [🚫 Не зможу] [🔔 Нагадати за 24 год]",
         "reminder.60m": "⏰ Нагадуємо: через 1 год почнеться {title}. Посилання: {link}",
+        "feedback.ask": "Дякуємо за участь у *{title}*.\nОцініть, будь ласка:\n1) Корисність: ⭐️1–5\n2) Чи зрозумілі наступні кроки? ✅ Так / ⚠️ Частково / ❌ Ні\nМожна додати коментар: [✍️ Написати відгук]",
         "reminder.24h": "🔔 Нагадуємо: завтра о {time} відбудеться {title}.\nПосилання: {link}",
-        "feedback.ask": "Дякуємо за участь у *{title}*.\nОцініть, будь ласка (1–5 ⭐️) та додайте коментар.",
         "update.notice": "🛠 Оновлення зустрічі {title}.\nЗверніть увагу: {what}",
         "cancel.notice": "❌ Зустріч {title} скасовано. Ми надішлемо нову дату найближчим часом.",
-        "help.body": "👋 Це бот для запрошень на наші онлайн-зустрічі.",
+        "help.body": "👋 Це бот для запрошень на наші онлайн-зустрічі.\n\nВи отримуватимете інвайти та нагадування. Кнопки під повідомленням:\n• ✅ Так, буду — підтвердити участь (ми нагадаємо за 24 год і за 1 год)\n• 🚫 Не зможу — пропустити цю дату (ми запропонуємо іншу)\n• 🔔 Нагадати за 24 год — якщо ще не вирішили.",
     }
     return FALLBACKS.get(key, "")
 
@@ -227,14 +229,11 @@ def upsert_client(tg_user_id: int, full_name: str, phone: str, status: str = "ac
     }
     existing_row = find_row_by_value(w, "tg_user_id", tg_user_id)
     if existing_row:
-        # зберігаємо created_at зі старого
-        old = w.row_values(existing_row)
+        # збережемо старий created_at
+        old_vals = w.row_values(existing_row)
         headers = ws_headers(w)
-        try:
-            old_map = {headers[i]: old[i] if i < len(old) else "" for i in range(len(headers))}
-            payload["created_at"] = old_map.get("created_at", now)
-        except Exception:
-            pass
+        old_map = {headers[i]: old_vals[i] if i < len(old_vals) else "" for i in range(len(headers))}
+        payload["created_at"] = old_map.get("created_at", now)
         update_row_dict(w, existing_row, payload)
     else:
         append_dict(w, payload)
@@ -321,9 +320,8 @@ def list_alternative_events_same_type(type_code: int, exclude_event_id: str) -> 
 
 def mark_attendance(event_id: str, client_id: str, attended: int = 1) -> None:
     w = ws(SHEET_ATTEND)
-    row = None
-    # унікально по (event_id, client_id)
     rows = get_all_records(w)
+    row = None
     for i, r in enumerate(rows, start=2):
         if str(r.get("event_id")) == event_id and str(r.get("client_id")) == client_id:
             row = i
@@ -358,12 +356,12 @@ def rsvp_upsert(event_id: str, client_id: str, rsvp: Optional[str] = None,
     w = ws(SHEET_RSVP)
     rows = get_all_records(w)
     row_idx = None
+    base = {}
     for i, r in enumerate(rows, start=2):
         if str(r.get("event_id")) == event_id and str(r.get("client_id")) == client_id:
             row_idx = i
             base = r
             break
-    base = base if row_idx else {}
     payload = {
         "event_id": event_id,
         "client_id": client_id,
@@ -391,7 +389,6 @@ def feedback_save(event_id: str, client_id: str, stars: int, comment: str = "") 
         "comment": comment or "",
         "owner": "",
     }
-    # перезапис по унікальному ключу (event_id, client_id) — простий варіант: add новий рядок
     append_dict(w, payload)
     if stars < 4:
         log_action("feedback_low_routed", client_id=client_id, event_id=event_id, details=f"stars={stars}")
@@ -399,7 +396,6 @@ def feedback_save(event_id: str, client_id: str, stars: int, comment: str = "") 
 def feedback_assign_owner(event_id: str, client_id: str, owner: str) -> None:
     w = ws(SHEET_FEEDBACK)
     rows = get_all_records(w)
-    # знаходимо останній запис для пари
     last_idx = None
     for i, r in enumerate(rows, start=2):
         if str(r.get("event_id")) == event_id and str(r.get("client_id")) == client_id:
@@ -407,12 +403,20 @@ def feedback_assign_owner(event_id: str, client_id: str, owner: str) -> None:
     if last_idx:
         update_cell(w, last_idx, "owner", owner)
 
-# ============================== UI BUILDERS ===================================
+def try_get_tg_from_client_id(client_id: str) -> Optional[int]:
+    w = ws(SHEET_CLIENTS)
+    rows = get_all_records(w)
+    for r in rows:
+        if str(r.get("client_id")) == str(client_id):
+            return int(r.get("tg_user_id"))
+    return None
+
+# ============================== KEYBOARDS ======================================
 
 def kb_admin_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Додати конференцію", callback_data="admin:add")],
-        [InlineKeyboardButton("📋 Список конференцій", callback_data="admin:list:0")]
+        [InlineKeyboardButton("📋 Список конференцій", callback_data="admin:list:0")],
     ])
 
 def kb_rsvp(event_id: str) -> InlineKeyboardMarkup:
@@ -424,6 +428,13 @@ def kb_rsvp(event_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔔 Нагадати за 24 год", callback_data=f"rsvp:{event_id}:remind")],
     ])
 
+def kb_event_actions(event_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Змінити", callback_data=f"admin:edit:{event_id}")],
+        [InlineKeyboardButton("❌ Скасувати", callback_data=f"admin:cancel:{event_id}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin:list:0")],
+    ])
+
 def kb_edit_event_menu(event_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Назва", callback_data=f"admin:edit:{event_id}:field:title")],
@@ -431,89 +442,86 @@ def kb_edit_event_menu(event_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🗓 Дата/час", callback_data=f"admin:edit:{event_id}:field:start_at")],
         [InlineKeyboardButton("⏱ Тривалість (хв)", callback_data=f"admin:edit:{event_id}:field:duration_min")],
         [InlineKeyboardButton("🔗 Посилання", callback_data=f"admin:edit:{event_id}:field:link")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:list:0")]
-    ])
-
-def kb_event_actions(event_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Змінити", callback_data=f"admin:edit:{event_id}")],
-        [InlineKeyboardButton("❌ Скасувати", callback_data=f"admin:cancel:{event_id}")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="admin:list:0")]
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:list:0")],
     ])
 
 def kb_cancel_confirm(event_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Так, скасувати", callback_data=f"admin:cancel:{event_id}:yes")],
-        [InlineKeyboardButton("⬅️ Ні, назад", callback_data=f"admin:edit:{event_id}")]
+        [InlineKeyboardButton("⬅️ Ні, назад", callback_data=f"admin:edit:{event_id}")],
     ])
 
 def kb_claim_feedback(event_id: str, client_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛠 Беру в роботу", callback_data=f"claim:{event_id}:{client_id}")]
+        [InlineKeyboardButton("🛠 Беру в роботу", callback_data=f"claim:{event_id}:{client_id}")],
     ])
 
-# ============================== STATE STORAGE =================================
+# ============================== STATE / MEMORY =================================
 
 ADMINS: set[int] = set()
-USER_STATE: Dict[int, Dict[str, Any]] = {}   # простий FSM у пам'яті
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMINS
+class RegisterSG(StatesGroup):
+    wait_name = State()
+    wait_phone = State()
 
-def require_admin(update: Update) -> bool:
-    uid = update.effective_user.id if update.effective_user else 0
-    return is_admin(uid)
+class AdminAddSG(StatesGroup):
+    menu = State()
+    wait_title = State()
+    wait_desc = State()
+    wait_start_at = State()
+    wait_duration = State()
+    wait_link = State()
 
-def set_state(user_id: int, mode: str, step: str, data: Optional[Dict[str, Any]] = None):
-    USER_STATE[user_id] = {"mode": mode, "step": step, "data": data or {}}
+class AdminEditFieldSG(StatesGroup):
+    wait_value = State()
 
-def get_state(user_id: int) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
-    s = USER_STATE.get(user_id, {})
-    return s.get("mode"), s.get("step"), s.get("data", {})
+class FeedbackSG(StatesGroup):
+    wait_comment = State()
 
-def clear_state(user_id: int):
-    USER_STATE.pop(user_id, None)
+# ================================ BOT/DP =======================================
 
-# ================================ HANDLERS ====================================
+bot = Bot(BOT_TOKEN, parse_mode="Markdown")
+dp = Dispatcher(storage=MemoryStorage())
+scheduler = AsyncIOScheduler(timezone=str(TZ))
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    user = update.effective_user
-    args = context.args or []
-    arg = args[0] if args else ""
-    touch_client_seen(user.id)
+# =============================== HANDLERS ======================================
 
-    # Адмін-режим через deep-link: /start admin_<password>
+@dp.message(CommandStart())
+async def cmd_start(m: Message, state: FSMContext):
+    touch_client_seen(m.from_user.id)
+    args = (m.text or "").split(maxsplit=1)
+    arg = ""
+    if len(args) > 1:
+        # /start <payload>
+        arg = args[1].strip()
+
+    # Адмін-режим
     if arg.startswith("admin_"):
         pwd = arg.split("admin_", 1)[1]
         if pwd == ADMIN_PASSWORD:
-            ADMINS.add(user.id)
-            await msg.reply_text("Вітаю в адмін-панелі.", reply_markup=kb_admin_main())
+            ADMINS.add(m.from_user.id)
+            await m.answer("Вітаю в адмін-панелі.", reply_markup=kb_admin_main())
             return
         else:
-            await msg.reply_text("Невірний пароль для адмін-панелі.")
+            await m.answer("Невірний пароль для адмін-панелі.")
             return
 
-    # Клієнтський старт
-    cli = get_client_by_tg(user.id)
+    # Клієнтський режим
+    cli = get_client_by_tg(m.from_user.id)
     if not cli or not cli.get("full_name") or not cli.get("phone"):
-        await msg.reply_text("👋 Привіт! Вкажіть, будь ласка, Ваше ПІБ (українською).")
-        set_state(user.id, "register", "wait_name", {})
+        await state.set_state(RegisterSG.wait_name)
+        await m.answer("👋 Привіт! Вкажіть, будь ласка, Ваше ПІБ (українською).")
         return
 
-    # Уже зареєстрований — показ переліку типів з відмітками
-    await send_welcome_and_types_list(update, context, cli)
+    await send_welcome_and_types_list(m, cli)
 
-async def send_welcome_and_types_list(update: Update, context: ContextTypes.DEFAULT_TYPE, cli: Dict[str, Any]):
-    user = update.effective_user
-    msg = update.effective_message
+async def send_welcome_and_types_list(m: Message, cli: Dict[str, Any]):
     text = (
         "✅ Ви підключені до розсилки на конференції.\n"
         "Надсилатимемо інвайти на найближчі події.\n\n"
         "Доступні типи конференцій:\n"
     )
     rows = get_eventtypes_active()
-    # Визначаємо відвідані по типу
     lines = []
     for rt in rows:
         tcode = a2i(rt.get("type_code"))
@@ -522,282 +530,260 @@ async def send_welcome_and_types_list(update: Update, context: ContextTypes.DEFA
         flag = "✅ Був(ла)" if attended else "⭕️ Ще не був(ла)"
         lines.append(f"• {title} — {flag}")
     text += "\n".join(lines) if lines else "Наразі немає активних типів."
-    await msg.reply_text(text)
+    await m.answer(text)
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(messages_get("help.body"))
+@dp.message(Command("help"))
+async def cmd_help(m: Message):
+    await m.answer(messages_get("help.body"))
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    msg = update.effective_message
-    mode, step, data = get_state(user.id)
+# ---------- Реєстрація клієнта ----------
 
-    # Реєстрація клієнта: ПІБ -> телефон
-    if mode == "register" and step == "wait_name":
-        full_name = (msg.text or "").strip()
-        if len(full_name) < 3:
-            await msg.reply_text("Будь ласка, введіть коректне ПІБ (не менше 3 символів).")
-            return
-        data["full_name"] = full_name
-        set_state(user.id, "register", "wait_phone", data)
-        await msg.reply_text("Вкажіть номер телефону у форматі 380XXXXXXXXX:")
+@dp.message(RegisterSG.wait_name)
+async def reg_wait_name(m: Message, state: FSMContext):
+    full_name = (m.text or "").strip()
+    if len(full_name) < 3:
+        await m.answer("Будь ласка, введіть коректне ПІБ (не менше 3 символів).")
         return
+    await state.update_data(full_name=full_name)
+    await state.set_state(RegisterSG.wait_phone)
+    await m.answer("Вкажіть номер телефону у форматі 380XXXXXXXXX:")
 
-    if mode == "register" and step == "wait_phone":
-        phone = normalize_phone(msg.text or "")
-        if not phone:
-            await msg.reply_text("Невірний формат. Приклад: 380671234567. Спробуйте ще раз:")
-            return
-        cli = upsert_client(user.id, data["full_name"], phone)
-        clear_state(user.id)
-        await send_welcome_and_types_list(update, context, cli)
+@dp.message(RegisterSG.wait_phone)
+async def reg_wait_phone(m: Message, state: FSMContext):
+    phone = normalize_phone(m.text or "")
+    if not phone:
+        await m.answer("Невірний формат. Приклад: 380671234567. Спробуйте ще раз:")
         return
+    data = await state.get_data()
+    cli = upsert_client(m.from_user.id, data["full_name"], phone)
+    await state.clear()
+    await send_welcome_and_types_list(m, cli)
 
-    # Адмін: майстер створення — редагування титулу/опису/дат/тривалості/лінку
-    if mode == "admin_add":
-        if step == "await_title":
-            data["title"] = (msg.text or "").strip()
-            set_state(user.id, "admin_add", "menu", data)
-            await msg.reply_text(f"Назву оновлено.\n\nПоточні дані:\n• Тип: {data['type_title']}\n• Назва: {data['title']}\n• Опис: {data['description']}\n\nНатисніть «➡️ Далі» або змініть інше поле.",
-                                 reply_markup=InlineKeyboardMarkup([
-                                     [InlineKeyboardButton("✏️ Змінити назву", callback_data="admin:add:edit_title")],
-                                     [InlineKeyboardButton("✏️ Змінити опис", callback_data="admin:add:edit_desc")],
-                                     [InlineKeyboardButton("➡️ Далі", callback_data="admin:add:next")]
-                                 ]))
-            return
-        if step == "await_desc":
-            data["description"] = (msg.text or "").strip()
-            set_state(user.id, "admin_add", "menu", data)
-            await msg.reply_text(f"Опис оновлено.\n\nПоточні дані:\n• Тип: {data['type_title']}\n• Назва: {data['title']}\n• Опис: {data['description']}\n\nНатисніть «➡️ Далі» або змініть інше поле.",
-                                 reply_markup=InlineKeyboardMarkup([
-                                     [InlineKeyboardButton("✏️ Змінити назву", callback_data="admin:add:edit_title")],
-                                     [InlineKeyboardButton("✏️ Змінити опис", callback_data="admin:add:edit_desc")],
-                                     [InlineKeyboardButton("➡️ Далі", callback_data="admin:add:next")]
-                                 ]))
-            return
-        if step == "await_start_at":
-            dt = parse_dt(msg.text or "")
-            if not dt:
-                await msg.reply_text("Невірний формат. Приклад: 2025-10-05 15:00 (Київ). Спробуйте ще раз:")
-                return
-            data["start_at"] = iso_dt(dt)
-            set_state(user.id, "admin_add", "await_duration", data)
-            await msg.reply_text("Вкажіть тривалість у хвилинах (ціле число):")
-            return
-        if step == "await_duration":
-            try:
-                dur = int((msg.text or "").strip())
-                if dur <= 0:
-                    raise ValueError()
-            except Exception:
-                await msg.reply_text("Вкажіть додатне ціле число хвилин. Спробуйте ще раз:")
-                return
-            data["duration_min"] = dur
-            set_state(user.id, "admin_add", "await_link", data)
-            await msg.reply_text("Вставте посилання на конференцію (URL):")
-            return
-        if step == "await_link":
-            link = (msg.text or "").strip()
-            data["link"] = link
-            # створення події
-            created = create_event(
-                type_code=int(data["type_code"]),
-                title=data["title"],
-                description=data["description"],
-                start_at=data["start_at"],
-                duration_min=int(data["duration_min"]),
-                link=data["link"],
-                created_by=f"admin:{user.id}"
-            )
-            clear_state(user.id)
-            await msg.reply_text(
-                f"✅ Подію створено:\n"
-                f"• {created['title']}\n"
-                f"• Дата/час: {created['start_at']} (Київ)\n"
-                f"• Тривалість: {created['duration_min']} хв\n"
-                f"• Посилання: {created['link']}\n",
-                reply_markup=kb_admin_main()
-            )
-            return
+# ---------- Адмін меню / додати / список / редагування ----------
 
-    if mode == "admin_edit_field":
-        event_id = data.get("event_id")
-        field = data.get("field")
-        if field in {"title", "description", "link"}:
-            val = (msg.text or "").strip()
-            update_event_field(event_id, field, val)
-            await msg.reply_text("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
-            clear_state(user.id)
-            # повідомлення учасникам про оновлення (якщо треба)
-            await notify_event_update(context, event_id, f"Змінено поле: {field}")
-            return
-        elif field == "start_at":
-            dt = parse_dt(msg.text or "")
-            if not dt:
-                await msg.reply_text("Невірний формат. Приклад: 2025-10-05 15:00. Спробуйте ще раз:")
-                return
-            update_event_field(event_id, "start_at", iso_dt(dt))
-            await msg.reply_text("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
-            clear_state(user.id)
-            await notify_event_update(context, event_id, "Змінено дату/час")
-            return
-        elif field == "duration_min":
-            try:
-                dur = int((msg.text or "").strip())
-                if dur <= 0:
-                    raise ValueError()
-            except Exception:
-                await msg.reply_text("Введіть додатне ціле число. Спробуйте ще раз:")
-                return
-            update_event_field(event_id, "duration_min", dur)
-            await msg.reply_text("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
-            clear_state(user.id)
-            await notify_event_update(context, event_id, "Змінено тривалість")
-            return
-
-    if mode == "feedback_comment":
-        event_id = data.get("event_id")
-        client_id = data.get("client_id")
-        stars = int(data.get("stars", 0))
-        comment = (msg.text or "").strip()
-        feedback_save(event_id, client_id, stars, comment)
-        clear_state(user.id)
-        await msg.reply_text("Дякуємо! Відгук збережено.")
-        if stars < 4:
-            await route_low_feedback(context, event_id, client_id, stars, comment)
+@dp.callback_query(F.data == "admin:add")
+async def admin_add(q: CallbackQuery, state: FSMContext):
+    if q.from_user.id not in ADMINS:
+        await q.answer()
         return
-
-# ============================== CALLBACKS =====================================
-
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = update.effective_user
-    data = query.data or ""
-    await query.answer()
-
-    # Адмін навігація
-    if data == "admin:add":
-        if not is_admin(user.id):
-            return
-        # Показ списку типів (за тайтлами)
-        types = get_eventtypes_active()
-        if not types:
-            await query.edit_message_text("Немає активних типів конференцій.", reply_markup=kb_admin_main())
-            return
-        buttons = [[InlineKeyboardButton(t["title"], callback_data=f"admin:add:type:{t['type_code']}")] for t in types]
-        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:home")])
-        await query.edit_message_text("Оберіть тип конференції:", reply_markup=InlineKeyboardMarkup(buttons))
+    types = get_eventtypes_active()
+    if not types:
+        await q.message.edit_text("Немає активних типів конференцій.", reply_markup=kb_admin_main())
+        await q.answer()
         return
+    buttons = [[InlineKeyboardButton(t["title"], callback_data=f"admin:add:type:{t['type_code']}")] for t in types]
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:home")])
+    await q.message.edit_text("Оберіть тип конференції:", reply_markup=InlineKeyboardMarkup(buttons))
+    await q.answer()
 
-    if data.startswith("admin:add:type:"):
-        if not is_admin(user.id):
-            return
-        type_code = int(data.split(":")[-1])
-        et = get_eventtype_by_code(type_code)
-        if not et:
-            await query.edit_message_text("Тип не знайдено.", reply_markup=kb_admin_main())
-            return
-        st = {
-            "type_code": type_code,
-            "type_title": et["title"],
-            "title": et["title"],
-            "description": et["description"],
-        }
-        set_state(user.id, "admin_add", "menu", st)
-        await query.edit_message_text(
-            f"Базові дані підставлено з довідника:\n"
-            f"• Тип: {st['type_title']}\n• Назва: {st['title']}\n• Опис: {st['description']}\n\n"
-            f"Можете підправити та натиснути «➡️ Далі».",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✏️ Змінити назву", callback_data="admin:add:edit_title")],
-                [InlineKeyboardButton("✏️ Змінити опис", callback_data="admin:add:edit_desc")],
-                [InlineKeyboardButton("➡️ Далі", callback_data="admin:add:next")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="admin:home")],
-            ])
-        )
+@dp.callback_query(F.data.startswith("admin:add:type:"))
+async def admin_add_select_type(q: CallbackQuery, state: FSMContext):
+    if q.from_user.id not in ADMINS:
+        await q.answer()
         return
-
-    if data == "admin:add:edit_title":
-        set_state(user.id, "admin_add", "await_title", USER_STATE[user.id]["data"])
-        await query.edit_message_text("Надішліть нову назву конференції:")
+    type_code = int(q.data.split(":")[-1])
+    et = get_eventtype_by_code(type_code)
+    if not et:
+        await q.message.edit_text("Тип не знайдено.", reply_markup=kb_admin_main())
+        await q.answer()
         return
+    payload = {
+        "type_code": type_code,
+        "type_title": et["title"],
+        "title": et["title"],
+        "description": et["description"],
+    }
+    await state.set_state(AdminAddSG.menu)
+    await state.update_data(**payload)
+    await q.message.edit_text(
+        f"Базові дані підставлено з довідника:\n"
+        f"• Тип: {payload['type_title']}\n• Назва: {payload['title']}\n• Опис: {payload['description']}\n\n"
+        f"Можете підправити та натиснути «➡️ Далі».",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Змінити назву", callback_data="admin:add:edit_title")],
+            [InlineKeyboardButton("✏️ Змінити опис", callback_data="admin:add:edit_desc")],
+            [InlineKeyboardButton("➡️ Далі", callback_data="admin:add:next")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="admin:home")],
+        ])
+    )
+    await q.answer()
 
-    if data == "admin:add:edit_desc":
-        set_state(user.id, "admin_add", "await_desc", USER_STATE[user.id]["data"])
-        await query.edit_message_text("Надішліть новий опис конференції:")
+@dp.callback_query(F.data == "admin:add:edit_title")
+async def admin_add_edit_title(q: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminAddSG.wait_title)
+    await q.message.edit_text("Надішліть нову назву конференції:")
+    await q.answer()
+
+@dp.message(AdminAddSG.wait_title)
+async def admin_add_wait_title(m: Message, state: FSMContext):
+    title = (m.text or "").strip()
+    await state.update_data(title=title)
+    data = await state.get_data()
+    await state.set_state(AdminAddSG.menu)
+    await m.answer(
+        f"Назву оновлено.\n\nПоточні дані:\n• Тип: {data['type_title']}\n• Назва: {data['title']}\n• Опис: {data['description']}\n\n"
+        f"Натисніть «➡️ Далі» або змініть інше поле.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Змінити назву", callback_data="admin:add:edit_title")],
+            [InlineKeyboardButton("✏️ Змінити опис", callback_data="admin:add:edit_desc")],
+            [InlineKeyboardButton("➡️ Далі", callback_data="admin:add:next")],
+        ])
+    )
+
+@dp.callback_query(F.data == "admin:add:edit_desc")
+async def admin_add_edit_desc(q: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminAddSG.wait_desc)
+    await q.message.edit_text("Надішліть новий опис конференції:")
+    await q.answer()
+
+@dp.message(AdminAddSG.wait_desc)
+async def admin_add_wait_desc(m: Message, state: FSMContext):
+    desc = (m.text or "").strip()
+    await state.update_data(description=desc)
+    data = await state.get_data()
+    await state.set_state(AdminAddSG.menu)
+    await m.answer(
+        f"Опис оновлено.\n\nПоточні дані:\n• Тип: {data['type_title']}\n• Назва: {data['title']}\n• Опис: {data['description']}\n\n"
+        f"Натисніть «➡️ Далі» або змініть інше поле.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Змінити назву", callback_data="admin:add:edit_title")],
+            [InlineKeyboardButton("✏️ Змінити опис", callback_data="admin:add:edit_desc")],
+            [InlineKeyboardButton("➡️ Далі", callback_data="admin:add:next")],
+        ])
+    )
+
+@dp.callback_query(F.data == "admin:add:next")
+async def admin_add_next(q: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminAddSG.wait_start_at)
+    await q.message.edit_text("Вкажіть дату та час початку у форматі: YYYY-MM-DD HH:MM (Київ). Напр.: 2025-10-05 15:00")
+    await q.answer()
+
+@dp.message(AdminAddSG.wait_start_at)
+async def admin_add_wait_start_at(m: Message, state: FSMContext):
+    dt = parse_dt(m.text or "")
+    if not dt:
+        await m.answer("Невірний формат. Приклад: 2025-10-05 15:00 (Київ). Спробуйте ще раз:")
         return
+    await state.update_data(start_at=iso_dt(dt))
+    await state.set_state(AdminAddSG.wait_duration)
+    await m.answer("Вкажіть тривалість у хвилинах (ціле число):")
 
-    if data == "admin:add:next":
-        _, step, st = get_state(user.id)
-        if not st:
-            await query.edit_message_text("Сесію створення перервано. Спробуйте ще раз.", reply_markup=kb_admin_main())
-            return
-        set_state(user.id, "admin_add", "await_start_at", st)
-        await query.edit_message_text("Вкажіть дату та час початку у форматі: YYYY-MM-DD HH:MM (Київ). Напр.: 2025-10-05 15:00")
+@dp.message(AdminAddSG.wait_duration)
+async def admin_add_wait_duration(m: Message, state: FSMContext):
+    try:
+        dur = int((m.text or "").strip())
+        if dur <= 0:
+            raise ValueError()
+    except Exception:
+        await m.answer("Вкажіть додатне ціле число хвилин. Спробуйте ще раз:")
         return
+    await state.update_data(duration_min=dur)
+    await state.set_state(AdminAddSG.wait_link)
+    await m.answer("Вставте посилання на конференцію (URL):")
 
-    if data.startswith("admin:list:"):
-        if not is_admin(user.id):
-            return
-        page = int(data.split(":")[-1])
-        events = list_future_events_sorted()
-        per = 10
-        total = len(events)
-        start = page * per
-        end = start + per
+@dp.message(AdminAddSG.wait_link)
+async def admin_add_wait_link(m: Message, state: FSMContext):
+    link = (m.text or "").strip()
+    data = await state.get_data()
+    created = create_event(
+        type_code=int(data["type_code"]),
+        title=data["title"],
+        description=data["description"],
+        start_at=data["start_at"],
+        duration_min=int(data["duration_min"]),
+        link=link,
+        created_by=f"admin:{m.from_user.id}",
+    )
+    await state.clear()
+    await m.answer(
+        f"✅ Подію створено:\n"
+        f"• {created['title']}\n"
+        f"• Дата/час: {created['start_at']} (Київ)\n"
+        f"• Тривалість: {created['duration_min']} хв\n"
+        f"• Посилання: {created['link']}\n",
+        reply_markup=kb_admin_main()
+    )
+
+@dp.callback_query(F.data == "admin:home")
+async def admin_home(q: CallbackQuery):
+    if q.from_user.id not in ADMINS:
+        await q.answer()
+        return
+    await q.message.edit_text("Адмін-панель:", reply_markup=kb_admin_main())
+    await q.answer()
+
+@dp.callback_query(F.data.startswith("admin:list:"))
+async def admin_list(q: CallbackQuery):
+    if q.from_user.id not in ADMINS:
+        await q.answer()
+        return
+    page = int(q.data.split(":")[-1])
+    events = list_future_events_sorted()
+    per = 10
+    total = len(events)
+    start = page * per
+    end = start + per
+    subset = events[start:end]
+    if not subset and page != 0:
+        page = 0
+        start, end = 0, per
         subset = events[start:end]
-        if not subset and page != 0:
-            page = 0
-            start, end = 0, per
-            subset = events[start:end]
-        buttons = []
-        for e in subset:
-            dt = event_start_dt(e)
-            dt_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "—"
-            buttons.append([InlineKeyboardButton(f"{e['title']} — {dt_str}", callback_data=f"admin:event:{e['event_id']}")])
-        nav = []
-        if start > 0:
-            nav.append(InlineKeyboardButton("⬅️", callback_data=f"admin:list:{page-1}"))
-        if end < total:
-            nav.append(InlineKeyboardButton("➡️", callback_data=f"admin:list:{page+1}"))
-        buttons.append(nav or [InlineKeyboardButton("—", callback_data="noop")])
-        buttons.append([InlineKeyboardButton("🏠 Головне меню", callback_data="admin:home")])
-        await query.edit_message_text(f"Список конференцій (усього: {total}):", reply_markup=InlineKeyboardMarkup(buttons))
-        return
+    buttons = []
+    for e in subset:
+        dt = event_start_dt(e)
+        dt_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "—"
+        buttons.append([InlineKeyboardButton(f"{e['title']} — {dt_str}", callback_data=f"admin:event:{e['event_id']}")])
+    nav = []
+    if start > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"admin:list:{page-1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"admin:list:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🏠 Головне меню", callback_data="admin:home")])
+    await q.message.edit_text(f"Список конференцій (усього: {total}):", reply_markup=InlineKeyboardMarkup(buttons))
+    await q.answer()
 
-    if data == "admin:home":
-        if not is_admin(user.id):
-            return
-        await query.edit_message_text("Адмін-панель:", reply_markup=kb_admin_main())
+@dp.callback_query(F.data.startswith("admin:event:"))
+async def admin_event_open(q: CallbackQuery):
+    if q.from_user.id not in ADMINS:
+        await q.answer()
         return
-
-    if data.startswith("admin:event:") and data.count(":") == 2:
-        if not is_admin(user.id):
-            return
-        event_id = data.split(":")[-1]
-        e = get_event_by_id(event_id)
-        if not e:
-            await query.edit_message_text("Подію не знайдено.", reply_markup=kb_admin_main())
-            return
-        await query.edit_message_text(
-            f"Подія:\n• {e['title']}\n• Опис: {e['description']}\n• Початок: {e['start_at']}\n"
-            f"• Тривалість: {e['duration_min']} хв\n• Посилання: {e['link']}",
-            reply_markup=kb_event_actions(event_id)
-        )
+    parts = q.data.split(":")
+    if len(parts) != 3:
+        await q.answer()
         return
-
-    if data.startswith("admin:edit:") and data.count(":") == 2:
-        if not is_admin(user.id):
-            return
-        event_id = data.split(":")[-1]
-        await query.edit_message_text("Оберіть поле для редагування:", reply_markup=kb_edit_event_menu(event_id))
+    event_id = parts[-1]
+    e = get_event_by_id(event_id)
+    if not e:
+        await q.message.edit_text("Подію не знайдено.", reply_markup=kb_admin_main())
+        await q.answer()
         return
+    await q.message.edit_text(
+        f"Подія:\n• {e['title']}\n• Опис: {e['description']}\n• Початок: {e['start_at']}\n"
+        f"• Тривалість: {e['duration_min']} хв\n• Посилання: {e['link']}",
+        reply_markup=kb_event_actions(event_id)
+    )
+    await q.answer()
 
-    if data.startswith("admin:edit:") and data.count(":") == 4 and ":field:" in data:
-        if not is_admin(user.id):
-            return
-        _, _, event_id, _, field = data.split(":")
-        set_state(user.id, "admin_edit_field", "await", {"event_id": event_id, "field": field})
+@dp.callback_query(F.data.startswith("admin:edit:"))
+async def admin_edit(q: CallbackQuery, state: FSMContext):
+    if q.from_user.id not in ADMINS:
+        await q.answer()
+        return
+    parts = q.data.split(":")
+    if len(parts) == 3:
+        # admin:edit:<event_id>
+        event_id = parts[-1]
+        await q.message.edit_text("Оберіть поле для редагування:", reply_markup=kb_edit_event_menu(event_id))
+        await q.answer()
+        return
+    # admin:edit:<event_id>:field:<field>
+    if len(parts) == 5 and parts[3] == "field":
+        event_id = parts[2]
+        field = parts[4]
+        await state.set_state(AdminEditFieldSG.wait_value)
+        await state.update_data(event_id=event_id, field=field)
         prompts = {
             "title": "Введіть нову назву:",
             "description": "Введіть новий опис:",
@@ -805,118 +791,134 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "duration_min": "Введіть нову тривалість у хвилинах:",
             "link": "Вставте нове посилання на конференцію:",
         }
-        await query.edit_message_text(prompts.get(field, "Введіть значення:"))
+        await q.message.edit_text(prompts.get(field, "Введіть значення:"))
+        await q.answer()
+
+@dp.message(AdminEditFieldSG.wait_value)
+async def admin_edit_field_value(m: Message, state: FSMContext):
+    data = await state.get_data()
+    event_id = data.get("event_id")
+    field = data.get("field")
+    if field in {"title", "description", "link"}:
+        val = (m.text or "").strip()
+        update_event_field(event_id, field, val)
+        await m.answer("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
+        await state.clear()
+        await notify_event_update(event_id, f"Змінено поле: {field}")
+        return
+    if field == "start_at":
+        dt = parse_dt(m.text or "")
+        if not dt:
+            await m.answer("Невірний формат. Приклад: 2025-10-05 15:00. Спробуйте ще раз:")
+            return
+        update_event_field(event_id, "start_at", iso_dt(dt))
+        await m.answer("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
+        await state.clear()
+        await notify_event_update(event_id, "Змінено дату/час")
+        return
+    if field == "duration_min":
+        try:
+            dur = int((m.text or "").strip())
+            if dur <= 0:
+                raise ValueError()
+        except Exception:
+            await m.answer("Введіть додатне ціле число. Спробуйте ще раз:")
+            return
+        update_event_field(event_id, "duration_min", dur)
+        await m.answer("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
+        await state.clear()
+        await notify_event_update(event_id, "Змінено тривалість")
         return
 
-    if data.startswith("admin:cancel:") and data.count(":") == 2:
-        if not is_admin(user.id):
-            return
-        event_id = data.split(":")[-1]
-        await query.edit_message_text("Підтвердити скасування події?", reply_markup=kb_cancel_confirm(event_id))
+@dp.callback_query(F.data.startswith("admin:cancel:"))
+async def admin_cancel(q: CallbackQuery):
+    if q.from_user.id not in ADMINS:
+        await q.answer()
         return
-
-    if data.startswith("admin:cancel:") and data.endswith(":yes"):
-        if not is_admin(user.id):
-            return
-        event_id = data.split(":")[2]
-        # повідомляємо учасникам з RSVP=going
-        await notify_event_cancel(context, event_id)
+    parts = q.data.split(":")
+    if len(parts) == 3:
+        event_id = parts[-1]
+        await q.message.edit_text("Підтвердити скасування події?", reply_markup=kb_cancel_confirm(event_id))
+        await q.answer()
+        return
+    if len(parts) == 4 and parts[-1] == "yes":
+        event_id = parts[2]
+        await notify_event_cancel(event_id)
         delete_event(event_id)
-        await query.edit_message_text("✅ Подію скасовано та видалено.", reply_markup=kb_admin_main())
+        await q.message.edit_text("✅ Подію скасовано та видалено.", reply_markup=kb_admin_main())
+        await q.answer()
         return
 
-    # Клієнтські RSVP
-    if data.startswith("rsvp:"):
-        _, event_id, action = data.split(":")
-        cli = get_client_by_tg(user.id)
-        if not cli:
-            await query.edit_message_text("Будь ласка, зареєструйтесь командою /start.")
-            return
-        client_id = cli["client_id"]
-        event = get_event_by_id(event_id)
-        if not event:
-            await query.edit_message_text("Подію не знайдено.")
-            return
+# ---------- RSVP ----------
 
-        if action == "going":
-            rsvp_upsert(event_id, client_id, rsvp="going")
-            # Фіксуємо відвідування як attended=1 (для логіки відміток та фідбеку)
-            mark_attendance(event_id, client_id, 1)
-            log_action("rsvp_yes", client_id=client_id, event_id=event_id, details="")
-            await query.edit_message_text("Дякуємо! Участь підтверджено ✅")
-            return
-
-        if action == "declined":
-            rsvp_upsert(event_id, client_id, rsvp="declined")
-            log_action("rsvp_no", client_id=client_id, event_id=event_id, details="")
-            # пропонуємо альтернативи цього самого типу
-            alt = list_alternative_events_same_type(a2i(event.get("type")), event_id)
-            if not alt:
-                await query.edit_message_text("Добре! Тоді очікуйте нове запрошення на іншу дату.")
-            else:
-                btns = [[InlineKeyboardButton(f"{a['title']} — {a['start_at']}", callback_data="noop")] for a in alt]
-                await query.edit_message_text("Можливі альтернативи:", reply_markup=InlineKeyboardMarkup(btns))
-            return
-
-        if action == "remind":
-            rsvp_upsert(event_id, client_id, rsvp="remind_24h", remind_24h=1)
-            log_action("rsvp_remind_24h", client_id=client_id, event_id=event_id, details="")
-            await query.edit_message_text("Гаразд! Нагадаємо за 24 години 🔔")
-            return
-
-    # Претензію взято у роботу (низький відгук)
-    if data.startswith("claim:"):
-        _, event_id, client_id = data.split(":")
-        owner = f"@{update.effective_user.username}" if update.effective_user and update.effective_user.username else f"id:{update.effective_user.id}"
-        feedback_assign_owner(event_id, client_id, owner)
-        log_action("complaint_taken", client_id=client_id, event_id=event_id, details=f"owner={owner}")
-        await query.edit_message_text(f"✅ Взято в роботу ({owner})")
+@dp.callback_query(F.data.startswith("rsvp:"))
+async def cb_rsvp(q: CallbackQuery):
+    parts = q.data.split(":")
+    # rsvp:<event_id>:<action>
+    if len(parts) != 3:
+        await q.answer()
         return
-
-# ================================= NOTIFY =====================================
-
-async def notify_event_update(context: ContextTypes.DEFAULT_TYPE, event_id: str, what: str):
-    # Розсилка оновлення тим, хто RSVP=going
+    _, event_id, action = parts
+    cli = get_client_by_tg(q.from_user.id)
+    if not cli:
+        await q.message.edit_text("Будь ласка, зареєструйтесь командою /start.")
+        await q.answer()
+        return
+    client_id = cli["client_id"]
     event = get_event_by_id(event_id)
     if not event:
+        await q.message.edit_text("Подію не знайдено.")
+        await q.answer()
         return
-    templ = messages_get("update.notice")
-    body = templ.format(title=event["title"], what=what)
-    # пробігаємо по RSVP
-    for r in rsvp_get_for_event(event_id):
-        if str(r.get("rsvp")) == "going":
-            tg_id = try_get_tg_from_client_id(r.get("client_id"))
-            if tg_id:
-                try:
-                    await context.bot.send_message(chat_id=int(tg_id), text=body)
-                except Exception:
-                    pass
 
-async def notify_event_cancel(context: ContextTypes.DEFAULT_TYPE, event_id: str):
-    event = get_event_by_id(event_id)
-    if not event:
+    if action == "going":
+        rsvp_upsert(event_id, client_id, rsvp="going")
+        mark_attendance(event_id, client_id, 1)
+        log_action("rsvp_yes", client_id=client_id, event_id=event_id, details="")
+        await q.message.edit_text("Дякуємо! Участь підтверджено ✅")
+        await q.answer()
         return
-    templ = messages_get("cancel.notice")
-    body = templ.format(title=event["title"])
-    for r in rsvp_get_for_event(event_id):
-        if str(r.get("rsvp")) == "going":
-            tg_id = try_get_tg_from_client_id(r.get("client_id"))
-            if tg_id:
-                try:
-                    await context.bot.send_message(chat_id=int(tg_id), text=body)
-                except Exception:
-                    pass
 
-def try_get_tg_from_client_id(client_id: str) -> Optional[int]:
-    w = ws(SHEET_CLIENTS)
-    rows = get_all_records(w)
-    for r in rows:
-        if str(r.get("client_id")) == str(client_id):
-            return int(r.get("tg_user_id"))
-    return None
+    if action == "declined":
+        rsvp_upsert(event_id, client_id, rsvp="declined")
+        log_action("rsvp_no", client_id=client_id, event_id=event_id, details="")
+        alt = list_alternative_events_same_type(a2i(event.get("type")), event_id)
+        if not alt:
+            await q.message.edit_text("Добре! Тоді очікуйте нове запрошення на іншу дату.")
+        else:
+            btns = [[InlineKeyboardButton(f"{a['title']} — {a['start_at']}", callback_data="noop")] for a in alt]
+            await q.message.edit_text("Можливі альтернативи:", reply_markup=InlineKeyboardMarkup(btns))
+        await q.answer()
+        return
 
-async def route_low_feedback(context: ContextTypes.DEFAULT_TYPE, event_id: str, client_id: str, stars: int, comment: str):
-    # повідомлення в чат підтримки з кнопкою «Беру в роботу»
+    if action == "remind":
+        rsvp_upsert(event_id, client_id, rsvp="remind_24h", remind_24h=1)
+        log_action("rsvp_remind_24h", client_id=client_id, event_id=event_id, details="")
+        await q.message.edit_text("Гаразд! Нагадаємо за 24 години 🔔")
+        await q.answer()
+        return
+
+@dp.callback_query(F.data.startswith("claim:"))
+async def claim_feedback(q: CallbackQuery):
+    # claim:<event_id>:<client_id>
+    parts = q.data.split(":")
+    if len(parts) != 3:
+        await q.answer()
+        return
+    _, event_id, client_id = parts
+    owner = f"@{q.from_user.username}" if q.from_user and q.from_user.username else f"id:{q.from_user.id}"
+    feedback_assign_owner(event_id, client_id, owner)
+    log_action("complaint_taken", client_id=client_id, event_id=event_id, details=f"owner={owner}")
+    await q.message.edit_text(f"✅ Взято в роботу ({owner})")
+    await q.answer()
+
+@dp.callback_query(F.data == "noop")
+async def noop(q: CallbackQuery):
+    await q.answer()
+
+# ---------- FEEDBACK (зірки + коментар) ----------
+
+async def route_low_feedback(event_id: str, client_id: str, stars: int, comment: str):
     cli_tg = try_get_tg_from_client_id(client_id)
     cli_row = get_client_by_tg(cli_tg) if cli_tg else None
     full_name = cli_row["full_name"] if cli_row else client_id
@@ -931,40 +933,103 @@ async def route_low_feedback(context: ContextTypes.DEFAULT_TYPE, event_id: str, 
         f"• Коментар: {comment or '—'}"
     )
     try:
-        await context.bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text,
-                                       reply_markup=kb_claim_feedback(event_id, client_id))
+        await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text,
+                               reply_markup=kb_claim_feedback(event_id, client_id))
     except Exception:
         pass
 
-# =============================== SCHEDULER ====================================
+@dp.callback_query(F.data.startswith("fb:"))
+async def fb_callbacks(q: CallbackQuery, state: FSMContext):
+    data = q.data or ""
+    # fb:<event_id>:<client_id>:<stars>
+    if data.startswith("fb:") and data.count(":") == 3:
+        _, event_id, client_id, stars = data.split(":")
+        stars = int(stars)
+        feedback_save(event_id, client_id, stars, "")
+        await q.message.edit_text(f"Дякуємо! Оцінка {stars}⭐️ збережена.")
+        if stars < 4:
+            await route_low_feedback(event_id, client_id, stars, "")
+        await q.answer()
+        return
+    # fb:comment:<event_id>:<client_id>
+    if data.startswith("fb:comment:"):
+        _, _, event_id, client_id = data.split(":")
+        tg_id = try_get_tg_from_client_id(client_id)
+        if not tg_id or not q.from_user or q.from_user.id != int(tg_id):
+            await q.message.edit_text("Введіть коментар у приватному діалозі з ботом.")
+            await q.answer()
+            return
+        await state.set_state(FeedbackSG.wait_comment)
+        await state.update_data(event_id=event_id, client_id=client_id)
+        await q.message.edit_text("Надішліть, будь ласка, текстовий відгук повідомленням.")
+        await q.answer()
 
-async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
+@dp.message(FeedbackSG.wait_comment)
+async def fb_wait_comment(m: Message, state: FSMContext):
+    data = await state.get_data()
+    comment = (m.text or "").strip()
+    # Якщо оцінка не складалась — збережемо як коментар з оцінкою 0
+    feedback_save(data["event_id"], data["client_id"], 0, comment)
+    await m.answer("Дякуємо! Відгук збережено.")
+    await state.clear()
+    # 0 < 4 -> маршрутизувати як скаргу
+    await route_low_feedback(data["event_id"], data["client_id"], 0, comment)
+
+# =============================== NOTIFY HELPERS ================================
+
+async def notify_event_update(event_id: str, what: str):
+    event = get_event_by_id(event_id)
+    if not event:
+        return
+    templ = messages_get("update.notice")
+    body = templ.format(title=event["title"], what=what)
+    for r in rsvp_get_for_event(event_id):
+        if str(r.get("rsvp")) == "going":
+            tg_id = try_get_tg_from_client_id(r.get("client_id"))
+            if tg_id:
+                try:
+                    await bot.send_message(chat_id=int(tg_id), text=body)
+                except Exception:
+                    pass
+
+async def notify_event_cancel(event_id: str):
+    event = get_event_by_id(event_id)
+    if not event:
+        return
+    templ = messages_get("cancel.notice")
+    body = templ.format(title=event["title"])
+    for r in rsvp_get_for_event(event_id):
+        if str(r.get("rsvp")) == "going":
+            tg_id = try_get_tg_from_client_id(r.get("client_id"))
+            if tg_id:
+                try:
+                    await bot.send_message(chat_id=int(tg_id), text=body)
+                except Exception:
+                    pass
+
+# =============================== SCHEDULER TICK ================================
+
+async def scheduler_tick():
     now = now_kyiv()
-    # 1) INVITES (-24h) -> усім активним, хто ще не був на типі
+    # 1) INVITES (-24h) -> активним, хто ще не був на цьому типі
     for e in list_future_events_sorted():
         dt = event_start_dt(e)
         if not dt:
             continue
-        # Вікно для відправки інвайтів: коли настав момент -24h (±60с)
         diff = (dt - now).total_seconds()
-        if 0 <= diff <= 60 + 5 or (24*3600 - 60) <= diff <= (24*3600 + 60):
-            # (покриваємо обидва варіанти у випадку дрібних зсувів)
-            # аудиторія
+        # Вікно для інвайтів (~24h)
+        if 24*3600 - 60 <= diff <= 24*3600 + 60:
             type_code = a2i(e.get("type"))
             for cli in list_active_clients():
                 cid = cli.get("client_id")
                 tg_id = cli.get("tg_user_id")
                 if not cid or not tg_id:
                     continue
-                # пропускаємо, якщо вже був на цьому типі
                 if client_has_attended_type(cid, type_code):
                     continue
-                # не дублюємо інвайт
                 if has_log("invite_sent", cid, e["event_id"]):
                     continue
-                # надсилаємо інвайт
-                title = e["title"]
-                descr = e["description"]
+                title = e["title"]; descr = e["description"]
                 body = messages_get("invite.body").format(
                     name=cli.get("full_name","Клієнт"),
                     title=title,
@@ -973,15 +1038,14 @@ async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
                     description=descr
                 )
                 try:
-                    await context.bot.send_message(chat_id=int(tg_id),
-                                                   text=messages_get("invite.title").format(title=title))
-                    await context.bot.send_message(chat_id=int(tg_id), text=body,
-                                                   reply_markup=kb_rsvp(e["event_id"]))
+                    await bot.send_message(chat_id=int(tg_id),
+                                           text=messages_get("invite.title").format(title=title))
+                    await bot.send_message(chat_id=int(tg_id), text=body, reply_markup=kb_rsvp(e["event_id"]))
                     log_action("invite_sent", client_id=cid, event_id=e["event_id"], details="")
                 except Exception:
                     pass
 
-        # 2) REMINDER -24h: тим, хто going або обрав remind_24h (щоб не плутатись з інвайтом — перевіряємо прапор reminded_24h)
+        # 2) REMINDER -24h (going or remind_24h, not reminded_24h)
         if 24*3600 - 60 <= diff <= 24*3600 + 60:
             for r in rsvp_get_for_event(e["event_id"]):
                 cid = r.get("client_id")
@@ -993,13 +1057,13 @@ async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
                 if str(r.get("rsvp")) in {"going", "remind_24h"}:
                     body = messages_get("reminder.24h").format(title=e["title"], time=fmt_time(dt), link=e["link"])
                     try:
-                        await context.bot.send_message(chat_id=int(tg_id), text=body)
+                        await bot.send_message(chat_id=int(tg_id), text=body)
                         rsvp_upsert(e["event_id"], cid, reminded_24h=1)
                         log_action("remind_24h_sent", client_id=cid, event_id=e["event_id"], details="")
                     except Exception:
                         pass
 
-        # 3) REMINDER -60m: тим, хто going
+        # 3) REMINDER -60m (going, not reminded_60m)
         if 60*60 - 60 <= diff <= 60*60 + 60:
             for r in rsvp_get_for_event(e["event_id"]):
                 cid = r.get("client_id")
@@ -1011,15 +1075,14 @@ async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
                 if str(r.get("rsvp")) == "going":
                     body = messages_get("reminder.60m").format(title=e["title"], link=e["link"])
                     try:
-                        await context.bot.send_message(chat_id=int(tg_id), text=body)
+                        await bot.send_message(chat_id=int(tg_id), text=body)
                         rsvp_upsert(e["event_id"], cid, reminded_60m=1)
                         log_action("remind_60m_sent", client_id=cid, event_id=e["event_id"], details="")
                     except Exception:
                         pass
 
-        # 4) FEEDBACK +3h: тим, хто attended=1
+        # 4) FEEDBACK +3h (attended=1), лише раз на подію
         if -60 <= (now - dt - timedelta(hours=3)).total_seconds() <= 60:
-            # збираємо фідбек лише раз
             if has_log("feedback_requested", client_id="", event_id=e["event_id"]):
                 continue
             w_att = ws(SHEET_ATTEND)
@@ -1031,7 +1094,6 @@ async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
                     if not tg_id:
                         continue
                     text = messages_get("feedback.ask").format(title=e["title"])
-                    # кнопки зі зірками 1..5 + комент
                     kb = InlineKeyboardMarkup([
                         [
                             InlineKeyboardButton("⭐️1", callback_data=f"fb:{e['event_id']}:{cid}:1"),
@@ -1043,60 +1105,21 @@ async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
                         [InlineKeyboardButton("✍️ Написати відгук", callback_data=f"fb:comment:{e['event_id']}:{cid}")]
                     ])
                     try:
-                        await context.bot.send_message(chat_id=int(tg_id), text=text, reply_markup=kb)
+                        await bot.send_message(chat_id=int(tg_id), text=text, reply_markup=kb)
                     except Exception:
                         pass
             log_action("feedback_requested", client_id="", event_id=e["event_id"], details="")
 
-async def feedback_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
+# ================================ STARTUP ======================================
 
-    # fb:<event_id>:<client_id>:<stars>
-    if data.startswith("fb:") and data.count(":") == 3:
-        _, event_id, client_id, stars = data.split(":")
-        stars = int(stars)
-        feedback_save(event_id, client_id, stars, "")
-        await query.edit_message_text(f"Дякуємо! Оцінка {stars}⭐️ збережена.")
-        if stars < 4:
-            await route_low_feedback(context, event_id, client_id, stars, "")
-        return
+async def on_startup():
+    # Планувальник: кожні 60с
+    scheduler.add_job(scheduler_tick, "interval", seconds=60, id="tick", replace_existing=True)
+    scheduler.start()
 
-    # fb:comment:<event_id>:<client_id>
-    if data.startswith("fb:comment:"):
-        _, _, event_id, client_id = data.split(":")
-        # шукаємо tg користувача
-        tg_id = try_get_tg_from_client_id(client_id)
-        if not tg_id or not update.effective_user or update.effective_user.id != int(tg_id):
-            await query.edit_message_text("Введіть коментар у приватному діалозі з ботом.")
-            return
-        set_state(tg_id, "feedback_comment", "await", {"event_id": event_id, "client_id": client_id, "stars": 0})
-        await query.edit_message_text("Надішліть, будь ласка, текстовий відгук повідомленням.")
-        return
-
-# ================================ MAIN ========================================
-
-async def post_init(app):
-    # Планувальник: 1 раз на 60 секунд
-    app.job_queue.run_repeating(scheduler_tick, interval=60, first=5)
-
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-
-    # commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-
-    # callbacks
-    app.add_handler(CallbackQueryHandler(callbacks, pattern="^(admin:|rsvp:|claim:|noop$)"))
-    app.add_handler(CallbackQueryHandler(feedback_callbacks, pattern="^(fb:)"))
-
-    # text messages (states)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-    app.run_polling(close_loop=False)
-
+async def main():
+    await on_startup()
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
