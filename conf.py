@@ -128,6 +128,10 @@ def normalize_phone(raw: str) -> Optional[str]:
         return "380" + digits
     return None
 
+def rsvp_get_for_event_ids_for_client(client_id: str) -> List[Dict[str, Any]]:
+    w = ws(SHEET_RSVP)
+    return [r for r in get_all_records(w) if str(r.get("client_id")) == str(client_id)]
+
 def a2i(v: Any, default: int = 0) -> int:
     try:
         return int(str(v).strip())
