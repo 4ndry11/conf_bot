@@ -951,14 +951,27 @@ async def cb_rsvp(q: CallbackQuery):
     if action == "declined":
         rsvp_upsert(event_id, client_id, rsvp="declined")
         log_action("rsvp_no", client_id=client_id, event_id=event_id, details="")
+    
         alt = list_alternative_events_same_type(a2i(event.get("type")), event_id)
         if not alt:
             await q.message.edit_text("Добре! Тоді очікуйте нове запрошення на іншу дату.")
         else:
-            btns = [[InlineKeyboardButton(text=f"{a['title']} — {a['start_at']}", callback_data="noop")] for a in alt]
-            await q.message.edit_text("Можливі альтернативи:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
-        await q.answer()
-        return
+            rows = []
+            for a in alt[:8]:  # не больше 8 кнопок
+                dt = event_start_dt(a)
+                when = f"{fmt_date(dt)} о {fmt_time(dt)}" if dt else a.get('start_at', '')
+                # Кнопка выбирает альтернативную дату
+                rows.append([InlineKeyboardButton(text=when, callback_data=f"alt:pick:{a['event_id']}")])
+            rows.append([InlineKeyboardButton(text="❌ Закрити", callback_data="noop")])
+    
+            title_for_info = event.get("title", "подія")
+            await q.message.edit_text(
+                f"Можливі альтернативні дати за темою «{title_for_info}»:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+        )
+    await q.answer()
+    return
+
 
     if action == "remind":
         rsvp_upsert(event_id, client_id, rsvp="remind_24h", remind_24h=1)
@@ -978,6 +991,43 @@ async def claim_feedback(q: CallbackQuery):
     feedback_assign_owner(event_id, client_id, owner)
     log_action("complaint_taken", client_id=client_id, event_id=event_id, details=f"owner={owner}")
     await q.message.edit_text(f"✅ Взято в роботу ({owner})")
+    await q.answer()
+    
+@dp.callback_query(F.data.startswith("alt:pick:"))
+async def alt_pick(q: CallbackQuery):
+    # alt:pick:<alt_event_id>
+    parts = q.data.split(":")
+    if len(parts) != 3:
+        await q.answer()
+        return
+
+    alt_event_id = parts[2]
+    cli = get_client_by_tg(q.from_user.id)
+    if not cli:
+        await q.message.edit_text("Будь ласка, зареєструйтесь командою /start.")
+        await q.answer()
+        return
+
+    client_id = cli["client_id"]
+    alt_event = get_event_by_id(alt_event_id)
+    if not alt_event:
+        await q.message.edit_text("Альтернативну дату не знайдено.")
+        await q.answer()
+        return
+
+    # подтверждаем участие на выбранной дате
+    rsvp_upsert(alt_event_id, client_id, rsvp="going")
+    mark_attendance(alt_event_id, client_id, 1)  # как и в обычном 'going' сейчас
+    log_action("rsvp_alt_yes", client_id=client_id, event_id=alt_event_id, details="picked_alternative")
+
+    dt = event_start_dt(alt_event)
+    when = f"{fmt_date(dt)} о {fmt_time(dt)}" if dt else alt_event.get("start_at", "")
+    await q.message.edit_text(
+        f"✅ Участь підтверджено на альтернативну дату:\n"
+        f"• {alt_event.get('title','')}\n"
+        f"• 🗓 {when}\n"
+        f"• 🔗 {alt_event.get('link','')}"
+    )
     await q.answer()
 
 @dp.callback_query(F.data == "noop")
