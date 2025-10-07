@@ -476,9 +476,9 @@ def kb_rsvp(event_id: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="✅ Так, буду", callback_data=f"rsvp:{event_id}:going"),
             InlineKeyboardButton(text="🚫 Не зможу", callback_data=f"rsvp:{event_id}:declined"),
-        ],
-        [InlineKeyboardButton(text="🔔 Нагадати за 24 год", callback_data=f"rsvp:{event_id}:remind")],
+        ]
     ])
+
 
 def kb_event_actions(event_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -745,6 +745,7 @@ async def admin_add_wait_link(m: Message, state: FSMContext):
         link=link,
         created_by=f"admin:{m.from_user.id}",
     )
+    await send_initial_invites_for_event(created)
     await state.clear()
     await m.answer(
         f"✅ Подію створено:\n"
@@ -973,13 +974,6 @@ async def cb_rsvp(q: CallbackQuery):
     return
 
 
-    if action == "remind":
-        rsvp_upsert(event_id, client_id, rsvp="remind_24h", remind_24h=1)
-        log_action("rsvp_remind_24h", client_id=client_id, event_id=event_id, details="")
-        await q.message.edit_text("Гаразд! Нагадаємо за 24 години 🔔")
-        await q.answer()
-        return
-
 @dp.callback_query(F.data.startswith("claim:"))
 async def claim_feedback(q: CallbackQuery):
     parts = q.data.split(":")
@@ -1180,6 +1174,37 @@ async def notify_event_cancel(event_id: str):
                     await bot.send_message(chat_id=int(tg_id), text=body)
                 except Exception:
                     pass
+async def send_initial_invites_for_event(event: Dict[str, Any]):
+    """Сразу рассылаем інвайт всем активным клиентам, кто не был на этом типе и не получал інвайт по этому event_id."""
+    dt = event_start_dt(event)
+    if not dt:
+        return
+    type_code = a2i(event.get("type"))
+    for cli in list_active_clients():
+        cid = cli.get("client_id"); tg_id = cli.get("tg_user_id")
+        if not cid or not tg_id:
+            continue
+        if client_has_attended_type(cid, type_code):
+            continue
+        if has_log("invite_sent", cid, event["event_id"]):
+            continue
+
+        body = messages_get("invite.body").format(
+            name=cli.get("full_name","Клієнт"),
+            title=event["title"],
+            date=fmt_date(dt),
+            time=fmt_time(dt),
+            description=event["description"]
+        )
+        try:
+            await bot.send_message(chat_id=int(tg_id),
+                                   text=messages_get("invite.title").format(title=event["title"]))
+            await bot.send_message(chat_id=int(tg_id), text=body, reply_markup=kb_rsvp(event["event_id"]))
+            # создаём/обновляем строку RSVP (пока без ответа)
+            rsvp_upsert(event["event_id"], cid, rsvp="")
+            log_action("invite_sent", client_id=cid, event_id=event["event_id"], details="immediate")
+        except Exception as e:
+            log_action("invite_immediate_error", client_id=cid, event_id=event["event_id"], details=f"{e!r}")
 
 # =============================== SCHEDULER TICK ================================
 
@@ -1193,48 +1218,9 @@ async def scheduler_tick():
         # Скільки залишилось до старту (в секундах)
         diff = (dt - now).total_seconds()
 
-        # ================== 1) ІНВАЙТ за ~10 хв до початку ==================
-        # (було: 24*3600 ± 60)
-        if 10*60 - 60 <= diff <= 10*60 + 60:
-            type_code = a2i(e.get("type"))
-            for cli in list_active_clients():
-                cid = cli.get("client_id")
-                tg_id = cli.get("tg_user_id")
-                if not cid or not tg_id:
-                    continue
-                # не шлем тим, хто вже був на цьому типі
-                if client_has_attended_type(cid, type_code):
-                    continue
-                # не дублюємо інвайт по тому ж event_id
-                if has_log("invite_sent", cid, e["event_id"]):
-                    continue
 
-                title = e["title"]
-                descr = e["description"]
-                body = messages_get("invite.body").format(
-                    name=cli.get("full_name", "Клієнт"),
-                    title=title,
-                    date=fmt_date(dt),
-                    time=fmt_time(dt),
-                    description=descr
-                )
-                try:
-                    await bot.send_message(
-                        chat_id=int(tg_id),
-                        text=messages_get("invite.title").format(title=title)
-                    )
-                    await bot.send_message(
-                        chat_id=int(tg_id),
-                        text=body,
-                        reply_markup=kb_rsvp(e["event_id"])
-                    )
-                    log_action("invite_sent", client_id=cid, event_id=e["event_id"], details="")
-                except Exception:
-                    pass
-
-        # ============= 2) НАГАДУВАННЯ за ~10 хв (going / remind_24h) =============
-        # (було: 24*3600 ± 60)
-        if 10*60 - 60 <= diff <= 10*60 + 60:
+        # 2) REMINDER -24h (тільки для going, якщо ще не нагадували)
+        if 24*3600 - 60 <= diff <= 24*3600 + 60:
             for r in rsvp_get_for_event(e["event_id"]):
                 cid = r.get("client_id")
                 tg_id = try_get_tg_from_client_id(cid)
@@ -1242,16 +1228,15 @@ async def scheduler_tick():
                     continue
                 if a2i(r.get("reminded_24h"), 0) == 1:
                     continue
-                if str(r.get("rsvp")) in {"going", "remind_24h"}:
-                    body = messages_get("reminder.24h").format(
-                        title=e["title"], time=fmt_time(dt), link=e["link"]
-                    )
+                if str(r.get("rsvp")) == "going":
+                    body = messages_get("reminder.24h").format(title=e["title"], time=fmt_time(dt), link=e["link"])
                     try:
                         await bot.send_message(chat_id=int(tg_id), text=body)
                         rsvp_upsert(e["event_id"], cid, reminded_24h=1)
                         log_action("remind_24h_sent", client_id=cid, event_id=e["event_id"], details="")
                     except Exception:
                         pass
+
 
         # ============= 3) НАГАДУВАННЯ за ~5 хв (тільки going) ====================
         # (було: 60*60 ± 60)
