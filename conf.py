@@ -133,6 +133,49 @@ def a2i(v: Any, default: int = 0) -> int:
         return int(str(v).strip())
     except Exception:
         return default
+def is_earliest_upcoming_event_of_type(event: Dict[str, Any]) -> bool:
+    """True, если это ближайшее (по времени) будущее событие данного type."""
+    now = now_kyiv()
+    etype = a2i(event.get("type"))
+    dt_this = event_start_dt(event)
+    if not dt_this:
+        return False
+    # Собираем все будущие события этого типа и проверяем, что текущее — самое раннее.
+    cands: List[Tuple[datetime, Dict[str, Any]]] = []
+    for e in get_all_events():
+        if a2i(e.get("type")) != etype:
+            continue
+        dt = event_start_dt(e)
+        if dt and dt >= now:
+            cands.append((dt, e))
+    if not cands:
+        return False
+    cands.sort(key=lambda x: x[0])
+    return cands[0][1].get("event_id") == event.get("event_id")
+
+
+def client_has_active_invite_for_type(client_id: str, type_code: int) -> bool:
+    """
+    Есть ли у клиента 'активная' запись на событие этого типа в будущем:
+    - запись в RSVP по событию этого типа и
+    - RSVP в состоянии "" (ещё не ответил) или "going".
+    """
+    now = now_kyiv()
+    # Соберём события по id
+    events_by_id = {e.get("event_id"): e for e in get_all_events()}
+    for r in rsvp_get_for_event_ids_for_client(client_id):
+        ev = events_by_id.get(str(r.get("event_id")))
+        if not ev:
+            continue
+        if a2i(ev.get("type")) != int(type_code):
+            continue
+        dt = event_start_dt(ev)
+        if not dt or dt < now:
+            continue
+        rsvp_val = str(r.get("rsvp") or "")
+        if rsvp_val in {"", "going"}:
+            return True
+    return False
 
 # =============================== SHEET NAMES ===================================
 
@@ -1175,16 +1218,26 @@ async def notify_event_cancel(event_id: str):
                 except Exception:
                     pass
 async def send_initial_invites_for_event(event: Dict[str, Any]):
-    """Сразу рассылаем інвайт всем активным клиентам, кто не был на этом типе и не получал інвайт по этому event_id."""
+    """Сразу рассылаем інвайт всем активным клиентам, кто не был на этом типе и не получал інвайт по этому event_id.
+       Плюс антиспам: шлём только для ближайшего события этого типа и только если у клиента нет активного інвайта по типу.
+    """
     dt = event_start_dt(event)
     if not dt:
         return
+
+    # 1) Шлём інвайты только для ближайшей даты этого типа
+    if not is_earliest_upcoming_event_of_type(event):
+        return
+
     type_code = a2i(event.get("type"))
     for cli in list_active_clients():
         cid = cli.get("client_id"); tg_id = cli.get("tg_user_id")
         if not cid or not tg_id:
             continue
         if client_has_attended_type(cid, type_code):
+            continue
+        # 2) Если у клиента уже есть "активный" інвайт по этому типу — не дублируем
+        if client_has_active_invite_for_type(cid, type_code):
             continue
         if has_log("invite_sent", cid, event["event_id"]):
             continue
@@ -1206,6 +1259,7 @@ async def send_initial_invites_for_event(event: Dict[str, Any]):
         except Exception as e:
             log_action("invite_immediate_error", client_id=cid, event_id=event["event_id"], details=f"{e!r}")
 
+
 # =============================== SCHEDULER TICK ================================
 
 async def scheduler_tick():
@@ -1215,12 +1269,12 @@ async def scheduler_tick():
         if not dt:
             continue
 
-        # Скільки залишилось до старту (в секундах)
+        # Сколько осталось до старта (в секундах)
         diff = (dt - now).total_seconds()
 
-
-        # 2) REMINDER -24h (тільки для going, якщо ще не нагадували)
-        if 24*3600 - 60 <= diff <= 24*3600 + 60:
+        # ============= 2) НАГАДУВАННЯ за ~3 хв (эмулируем 24h) ==================
+        # (было: 24*3600 ± 60)
+        if 3*60 - 60 <= diff <= 3*60 + 60:
             for r in rsvp_get_for_event(e["event_id"]):
                 cid = r.get("client_id")
                 tg_id = try_get_tg_from_client_id(cid)
@@ -1228,19 +1282,21 @@ async def scheduler_tick():
                     continue
                 if a2i(r.get("reminded_24h"), 0) == 1:
                     continue
+                # Только для тех, кто подтвердил участие
                 if str(r.get("rsvp")) == "going":
-                    body = messages_get("reminder.24h").format(title=e["title"], time=fmt_time(dt), link=e["link"])
+                    body = messages_get("reminder.24h").format(
+                        title=e["title"], time=fmt_time(dt), link=e["link"]
+                    )
                     try:
                         await bot.send_message(chat_id=int(tg_id), text=body)
                         rsvp_upsert(e["event_id"], cid, reminded_24h=1)
-                        log_action("remind_24h_sent", client_id=cid, event_id=e["event_id"], details="")
+                        log_action("remind_24h_sent", client_id=cid, event_id=e["event_id"], details="test_3min")
                     except Exception:
                         pass
 
-
-        # ============= 3) НАГАДУВАННЯ за ~5 хв (тільки going) ====================
-        # (було: 60*60 ± 60)
-        if 5*60 - 60 <= diff <= 5*60 + 60:
+        # ============= 3) НАГАДУВАННЯ за ~2 хв (эмулируем 60m) ==================
+        # (было: 60*60 ± 60, потом 5*60 ± 60)
+        if 2*60 - 60 <= diff <= 2*60 + 60:
             for r in rsvp_get_for_event(e["event_id"]):
                 cid = r.get("client_id")
                 tg_id = try_get_tg_from_client_id(cid)
@@ -1253,18 +1309,18 @@ async def scheduler_tick():
                     try:
                         await bot.send_message(chat_id=int(tg_id), text=body)
                         rsvp_upsert(e["event_id"], cid, reminded_60m=1)
-                        log_action("remind_60m_sent", client_id=cid, event_id=e["event_id"], details="")
+                        log_action("remind_60m_sent", client_id=cid, event_id=e["event_id"], details="test_2min")
                     except Exception:
                         pass
 
-        # ============= 4) ФІДБЕК через ~5 хв ПІСЛЯ ЗАВЕРШЕННЯ ====================
-        # (було: start_at + 3 години; стало: (start_at + duration_min) + 5 хв)
-        # 4) FEEDBACK ...
+        # ============= 4) ФІДБЕК через ~2 хв після завершення ====================
+        # (было: +3 часа, потом +5 мин; делаем +2 минуты от конца)
         end_dt = dt + timedelta(minutes=a2i(e.get("duration_min")))
-        if -60 <= (now - end_dt - timedelta(minutes=5)).total_seconds() <= 60:  # или твои боевые окна
+        if -60 <= (now - end_dt - timedelta(minutes=2)).total_seconds() <= 60:
             if has_log("feedback_requested", client_id="", event_id=e["event_id"]):
                 continue
-        
+
+            # Всем, у кого attended=1 по этому событию
             w_att = ws(SHEET_ATTEND)
             rows_att = get_all_records(w_att)
             for r in rows_att:
@@ -1273,7 +1329,7 @@ async def scheduler_tick():
                     tg_id = try_get_tg_from_client_id(cid)
                     if not tg_id:
                         continue
-        
+
                     text = messages_get("feedback.ask").format(title=e["title"])
                     kb = InlineKeyboardMarkup(inline_keyboard=[
                         [
@@ -1288,8 +1344,9 @@ async def scheduler_tick():
                         await bot.send_message(chat_id=int(tg_id), text=text, reply_markup=kb)
                     except Exception:
                         pass
-        
-            log_action("feedback_requested", client_id="", event_id=e["event_id"], details="")
+
+            log_action("feedback_requested", client_id="", event_id=e["event_id"], details="test_plus2min")
+
 
 
 
