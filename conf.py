@@ -181,6 +181,24 @@ def client_has_active_invite_for_type(client_id: str, type_code: int) -> bool:
             return True
     return False
 
+def build_types_overview_text(cli: Dict[str, Any]) -> str:
+    text = (
+        "✅ Ви підключені до розсилки на конференції.\n"
+        "Надсилатимемо інвайти на найближчі події.\n\n"
+        "Доступні типи конференцій:\n"
+    )
+    rows = get_eventtypes_active()
+    if not rows:
+        return text + "Наразі немає активних типів."
+    lines = []
+    for rt in rows:
+        tcode = a2i(rt.get("type_code"))
+        title = str(rt.get("title"))
+        attended = client_has_attended_type(cli["client_id"], tcode)
+        flag = "✅ Був(ла)" if attended else "⭕️ Ще не був(ла)"
+        lines.append(f"• {title} — {flag}")
+    return text + "\n".join(lines)
+
 # =============================== SHEET NAMES ===================================
 
 SHEET_EVENTTYPES = "EventTypes"
@@ -554,7 +572,11 @@ def kb_claim_feedback(event_id: str, client_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛠 Беру в роботу", callback_data=f"claim:{event_id}:{client_id}")],
     ])
-
+def kb_client_main() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📋 Мої конференції")]],
+        resize_keyboard=True
+    )
 # ============================== STATE / MEMORY =================================
 
 ADMINS: set[int] = set()
@@ -614,21 +636,8 @@ async def cmd_start(m: Message, state: FSMContext):
     await send_welcome_and_types_list(m, cli)
 
 async def send_welcome_and_types_list(m: Message, cli: Dict[str, Any]):
-    text = (
-        "✅ Ви підключені до розсилки на конференції.\n"
-        "Надсилатимемо інвайти на найближчі події.\n\n"
-        "Доступні типи конференцій:\n"
-    )
-    rows = get_eventtypes_active()
-    lines = []
-    for rt in rows:
-        tcode = a2i(rt.get("type_code"))
-        title = str(rt.get("title"))
-        attended = client_has_attended_type(cli["client_id"], tcode)
-        flag = "✅ Був(ла)" if attended else "⭕️ Ще не був(ла)"
-        lines.append(f"• {title} — {flag}")
-    text += "\n".join(lines) if lines else "Наразі немає активних типів."
-    await m.answer(text)
+    await m.answer(build_types_overview_text(cli), reply_markup=kb_client_main())
+
 
 @dp.message(Command("help"))
 async def cmd_help(m: Message):
@@ -656,6 +665,14 @@ async def reg_wait_phone(m: Message, state: FSMContext):
     cli = upsert_client(m.from_user.id, data["full_name"], phone)
     await state.clear()
     await send_welcome_and_types_list(m, cli)
+    
+@dp.message(F.text == "📋 Мої конференції")
+async def show_my_conferences(m: Message):
+    cli = get_client_by_tg(m.from_user.id)
+    if not cli:
+        await m.answer("Будь ласка, зареєструйтесь командою /start.", reply_markup=kb_client_main())
+        return
+    await m.answer(build_types_overview_text(cli), reply_markup=kb_client_main())
 
 # ---------- Адмін меню / додати / список / редагування ----------
 
@@ -1083,6 +1100,7 @@ async def route_low_feedback(event_id: str, client_id: str, stars: int, comment:
     full_name = cli_row["full_name"] if cli_row else client_id
     phone = cli_row["phone"] if cli_row else "—"
     event = get_event_by_id(event_id) or {}
+
     text = (
         f"⚠️ Низька оцінка події\n"
         f"• Подія: {event.get('title','')}\n"
@@ -1091,11 +1109,38 @@ async def route_low_feedback(event_id: str, client_id: str, stars: int, comment:
         f"• Оцінка: {stars}\n"
         f"• Коментар: {comment or '—'}"
     )
+    kb = kb_claim_feedback(event_id, client_id)
+
+    # 1) Пытаемся в SUPPORT_CHAT_ID
     try:
-        await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text,
-                               reply_markup=kb_claim_feedback(event_id, client_id))
-    except Exception:
-        pass
+        msg = await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text, reply_markup=kb)
+        log_action("feedback_low_notified", client_id=client_id, event_id=event_id, details=f"support_chat:{SUPPORT_CHAT_ID}")
+        return
+    except TelegramRetryAfter as ex:
+        await asyncio.sleep(ex.retry_after + 1)
+        try:
+            msg = await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text, reply_markup=kb)
+            log_action("feedback_low_notified", client_id=client_id, event_id=event_id, details=f"support_chat:{SUPPORT_CHAT_ID}/after_retry")
+            return
+        except Exception as ex2:
+            log_action("feedback_low_notify_fail", client_id=client_id, event_id=event_id, details=f"retry_fail:{type(ex2).__name__}")
+
+    except (TelegramForbiddenError, TelegramBadRequest) as ex:
+        # Бот не может писать в этот чат (не добавлен/не админ/неверный ID/канал закрыт и т.п.)
+        log_action("feedback_low_notify_fail", client_id=client_id, event_id=event_id, details=f"{type(ex).__name__}:{ex}")
+
+    except Exception as ex:
+        log_action("feedback_low_notify_fail", client_id=client_id, event_id=event_id, details=f"unknown:{type(ex).__name__}")
+
+    # 2) Фолбэк: личкой всем активным админам, если чат поддержки недоступен
+    if ADMINS:
+        for admin_id in list(ADMINS):
+            try:
+                await bot.send_message(chat_id=admin_id, text="(фолбэк) " + text, reply_markup=kb)
+                log_action("feedback_low_notified_admin_dm", client_id=client_id, event_id=event_id, details=f"to_admin:{admin_id}")
+            except Exception as ex:
+                log_action("feedback_low_admin_dm_fail", client_id=client_id, event_id=event_id, details=f"{admin_id}:{type(ex).__name__}")
+
 
 async def route_low_feedback_comment_update(event_id: str, client_id: str, comment: str):
     # короткая “добавка” к уже отправленной скарге
