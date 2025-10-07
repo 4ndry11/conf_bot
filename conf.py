@@ -22,7 +22,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,  # <-- добавь эти два
+)
 # =============================== CONFIG =======================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
