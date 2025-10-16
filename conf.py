@@ -6,6 +6,7 @@ import asyncio
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
 import gspread
 from gspread.utils import rowcol_to_a1
@@ -1316,17 +1317,21 @@ async def send_initial_invites_for_event(event: Dict[str, Any]):
 
 async def scheduler_tick():
     now = now_kyiv()
+
+    REM_24H = 24*3600
+    REM_60M = 60*60
+    FEEDBACK_DELAY = 5*60   # или 2*60, если хочешь, как было
+    JITTER = 60             # секунды, допуск на тик раз в минуту
+
     for e in list_future_events_sorted():
         dt = event_start_dt(e)
         if not dt:
             continue
 
-        # Сколько осталось до старта (в секундах)
-        diff = (dt - now).total_seconds()
+        diff = (dt - now).total_seconds()  # до старта, сек
 
-        # ============= 2) НАГАДУВАННЯ за ~3 хв (эмулируем 24h) ==================
-        # (было: 24*3600 ± 60)
-        if 3*60 - 60 <= diff <= 3*60 + 60:
+        # === Напоминание за 24 часа ===
+        if abs(diff - REM_24H) <= JITTER:
             for r in rsvp_get_for_event(e["event_id"]):
                 cid = r.get("client_id")
                 tg_id = try_get_tg_from_client_id(cid)
@@ -1334,7 +1339,6 @@ async def scheduler_tick():
                     continue
                 if a2i(r.get("reminded_24h"), 0) == 1:
                     continue
-                # Только для тех, кто подтвердил участие
                 if str(r.get("rsvp")) == "going":
                     body = messages_get("reminder.24h").format(
                         title=e["title"], time=fmt_time(dt), link=e["link"]
@@ -1342,13 +1346,12 @@ async def scheduler_tick():
                     try:
                         await bot.send_message(chat_id=int(tg_id), text=body)
                         rsvp_upsert(e["event_id"], cid, reminded_24h=1)
-                        log_action("remind_24h_sent", client_id=cid, event_id=e["event_id"], details="test_3min")
+                        log_action("remind_24h_sent", client_id=cid, event_id=e["event_id"], details="prod_24h")
                     except Exception:
                         pass
 
-        # ============= 3) НАГАДУВАННЯ за ~2 хв (эмулируем 60m) ==================
-        # (было: 60*60 ± 60, потом 5*60 ± 60)
-        if 2*60 - 60 <= diff <= 2*60 + 60:
+        # === Напоминание за 60 минут ===
+        if abs(diff - REM_60M) <= JITTER:
             for r in rsvp_get_for_event(e["event_id"]):
                 cid = r.get("client_id")
                 tg_id = try_get_tg_from_client_id(cid)
@@ -1361,18 +1364,17 @@ async def scheduler_tick():
                     try:
                         await bot.send_message(chat_id=int(tg_id), text=body)
                         rsvp_upsert(e["event_id"], cid, reminded_60m=1)
-                        log_action("remind_60m_sent", client_id=cid, event_id=e["event_id"], details="test_2min")
+                        log_action("remind_60m_sent", client_id=cid, event_id=e["event_id"], details="prod_60m")
                     except Exception:
                         pass
 
-        # ============= 4) ФІДБЕК через ~2 хв після завершення ====================
-        # (было: +3 часа, потом +5 мин; делаем +2 минуты от конца)
+        # === Фидбэк спустя FEEDBACK_DELAY после окончания ===
         end_dt = dt + timedelta(minutes=a2i(e.get("duration_min")))
-        if -60 <= (now - end_dt - timedelta(minutes=2)).total_seconds() <= 60:
+        post_end = (now - end_dt).total_seconds()
+        if abs(post_end - FEEDBACK_DELAY) <= JITTER:
             if has_log("feedback_requested", client_id="", event_id=e["event_id"]):
                 continue
 
-            # Всем, у кого attended=1 по этому событию
             w_att = ws(SHEET_ATTEND)
             rows_att = get_all_records(w_att)
             for r in rows_att:
@@ -1381,23 +1383,20 @@ async def scheduler_tick():
                     tg_id = try_get_tg_from_client_id(cid)
                     if not tg_id:
                         continue
-
                     text = messages_get("feedback.ask").format(title=e["title"])
-                    kb = InlineKeyboardMarkup(inline_keyboard=[
-                        [
-                            InlineKeyboardButton(text="⭐️1", callback_data=f"fb:{e['event_id']}:{cid}:1"),
-                            InlineKeyboardButton(text="⭐️2", callback_data=f"fb:{e['event_id']}:{cid}:2"),
-                            InlineKeyboardButton(text="⭐️3", callback_data=f"fb:{e['event_id']}:{cid}:3"),
-                            InlineKeyboardButton(text="⭐️4", callback_data=f"fb:{e['event_id']}:{cid}:4"),
-                            InlineKeyboardButton(text="⭐️5", callback_data=f"fb:{e['event_id']}:{cid}:5"),
-                        ]
-                    ])
+                    kb = InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="⭐️1", callback_data=f"fb:{e['event_id']}:{cid}:1"),
+                        InlineKeyboardButton(text="⭐️2", callback_data=f"fb:{e['event_id']}:{cid}:2"),
+                        InlineKeyboardButton(text="⭐️3", callback_data=f"fb:{e['event_id']}:{cid}:3"),
+                        InlineKeyboardButton(text="⭐️4", callback_data=f"fb:{e['event_id']}:{cid}:4"),
+                        InlineKeyboardButton(text="⭐️5", callback_data=f"fb:{e['event_id']}:{cid}:5"),
+                    ]])
                     try:
                         await bot.send_message(chat_id=int(tg_id), text=text, reply_markup=kb)
                     except Exception:
                         pass
 
-            log_action("feedback_requested", client_id="", event_id=e["event_id"], details="test_plus2min")
+            log_action("feedback_requested", client_id="", event_id=e["event_id"], details=f"delay={FEEDBACK_DELAY}")
 
 
 
