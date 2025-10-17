@@ -552,6 +552,44 @@ def try_get_tg_from_client_id(client_id: str) -> Optional[int]:
             return int(r.get("tg_user_id"))
     return None
 
+def get_event_statistics(event_id: str) -> Dict[str, Any]:
+    """Возвращает статистику по событию:
+    - invitations_sent: количество отправленных приглашений (из DeliveryLog)
+    - confirmed_count: количество подтвержденных участников (RSVP с rsvp='going')
+    - confirmed_clients: список клиентов, которые подтвердили участие (имя и телефон)
+    """
+    # Считаем приглашения из DeliveryLog
+    w_log = ws(SHEET_LOG)
+    log_rows = get_all_records(w_log)
+    invitations_sent = sum(1 for r in log_rows if str(r.get("action")) == "invite_sent" and str(r.get("event_id")) == event_id)
+
+    # Считаем подтверждения из RSVP и собираем список client_id
+    w_rsvp = ws(SHEET_RSVP)
+    rsvp_rows = get_all_records(w_rsvp)
+    confirmed_client_ids = [str(r.get("client_id")) for r in rsvp_rows if str(r.get("event_id")) == event_id and str(r.get("rsvp")) == "going"]
+
+    # Получаем данные клиентов
+    w_clients = ws(SHEET_CLIENTS)
+    client_rows = get_all_records(w_clients)
+
+    # Формируем список подтвердивших клиентов с их данными
+    confirmed_clients = []
+    for cid in confirmed_client_ids:
+        for cli in client_rows:
+            if str(cli.get("client_id")) == cid:
+                confirmed_clients.append({
+                    "client_id": cid,
+                    "full_name": cli.get("full_name", "—"),
+                    "phone": cli.get("phone", "—")
+                })
+                break
+
+    return {
+        "invitations_sent": invitations_sent,
+        "confirmed_count": len(confirmed_client_ids),
+        "confirmed_clients": confirmed_clients
+    }
+
 # ============================== KEYBOARDS ======================================
 
 def kb_admin_main() -> InlineKeyboardMarkup:
@@ -571,6 +609,7 @@ def kb_rsvp(event_id: str) -> InlineKeyboardMarkup:
 
 def kb_event_actions(event_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="ℹ️ Інфо", callback_data=f"admin:info:{event_id}")],
         [InlineKeyboardButton(text="✏️ Змінити", callback_data=f"admin:edit:{event_id}")],
         [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"admin:cancel:{event_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:list:0")],
@@ -595,6 +634,12 @@ def kb_cancel_confirm(event_id: str) -> InlineKeyboardMarkup:
 def kb_claim_feedback(event_id: str, client_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛠 Беру в роботу", callback_data=f"claim:{event_id}:{client_id}")],
+    ])
+
+def kb_event_info(event_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Оновити", callback_data=f"admin:info:{event_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin:event:{event_id}")],
     ])
 def kb_client_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -904,6 +949,46 @@ async def admin_event_open(q: CallbackQuery):
         f"• Тривалість: {e['duration_min']} хв\n• Посилання: {e['link']}",
         reply_markup=kb_event_actions(event_id)
     )
+    await q.answer()
+
+@dp.callback_query(F.data.startswith("admin:info:"))
+async def admin_info(q: CallbackQuery):
+    if q.from_user.id not in ADMINS:
+        await q.answer()
+        return
+    parts = q.data.split(":")
+    if len(parts) != 3:
+        await q.answer()
+        return
+    event_id = parts[-1]
+    e = get_event_by_id(event_id)
+    if not e:
+        await q.message.edit_text("Подію не знайдено.", reply_markup=kb_admin_main())
+        await q.answer()
+        return
+
+    # Получаем статистику
+    stats = get_event_statistics(event_id)
+
+    # Форматируем сообщение
+    text = (
+        f"ℹ️ Статистика події\n\n"
+        f"📌 Подія: {e['title']}\n"
+        f"🗓 Початок: {e['start_at']}\n\n"
+        f"📊 Статистика:\n"
+        f"• Відправлено запрошень: {stats['invitations_sent']}\n"
+        f"• Підтвердили участь: {stats['confirmed_count']}\n"
+    )
+
+    # Добавляем список подтвердивших клиентов
+    if stats['confirmed_clients']:
+        text += f"\n✅ Підтвердили участь:\n"
+        for i, cli in enumerate(stats['confirmed_clients'], 1):
+            text += f"{i}. {cli['full_name']} ({cli['phone']})\n"
+    else:
+        text += f"\n⚠️ Ще ніхто не підтвердив участь\n"
+
+    await q.message.edit_text(text, reply_markup=kb_event_info(event_id))
     await q.answer()
 
 @dp.callback_query(F.data.startswith("admin:edit:"))
