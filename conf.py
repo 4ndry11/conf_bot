@@ -141,16 +141,19 @@ def a2i(v: Any, default: int = 0) -> int:
         return int(str(v).strip())
     except Exception:
         return default
-def is_earliest_upcoming_event_of_type(event: Dict[str, Any]) -> bool:
-    """True, если это ближайшее (по времени) будущее событие данного type."""
+def is_earliest_upcoming_event_of_type(event: Dict[str, Any], all_events: Optional[List[Dict[str, Any]]] = None) -> bool:
+    """True, если это ближайшее (по времени) будущее событие данного type.
+    all_events - опциональный список всех событий для оптимизации (чтобы не читать Google Sheets каждый раз)."""
     now = now_kyiv()
     etype = a2i(event.get("type"))
     dt_this = event_start_dt(event)
     if not dt_this:
         return False
+    # Используем переданный список или загружаем заново
+    events = all_events if all_events is not None else get_all_events()
     # Собираем все будущие события этого типа и проверяем, что текущее — самое раннее.
     cands: List[Tuple[datetime, Dict[str, Any]]] = []
-    for e in get_all_events():
+    for e in events:
         if a2i(e.get("type")) != etype:
             continue
         dt = event_start_dt(e)
@@ -162,15 +165,17 @@ def is_earliest_upcoming_event_of_type(event: Dict[str, Any]) -> bool:
     return cands[0][1].get("event_id") == event.get("event_id")
 
 
-def client_has_active_invite_for_type(client_id: str, type_code: int) -> bool:
+def client_has_active_invite_for_type(client_id: str, type_code: int, events_by_id: Optional[Dict[str, Dict[str, Any]]] = None) -> bool:
     """
     Есть ли у клиента 'активная' запись на событие этого типа в будущем:
     - запись в RSVP по событию этого типа и
     - RSVP в состоянии "" (ещё не ответил) или "going".
+    events_by_id - опциональный словарь {event_id: event} для оптимизации.
     """
     now = now_kyiv()
-    # Соберём события по id
-    events_by_id = {e.get("event_id"): e for e in get_all_events()}
+    # Используем переданный словарь или создаём заново
+    if events_by_id is None:
+        events_by_id = {e.get("event_id"): e for e in get_all_events()}
     for r in rsvp_get_for_event_ids_for_client(client_id):
         ev = events_by_id.get(str(r.get("event_id")))
         if not ev:
@@ -194,11 +199,18 @@ def build_types_overview_text(cli: Dict[str, Any]) -> str:
     rows = get_eventtypes_active()
     if not rows:
         return text + "Наразі немає активних типів."
+
+    # Оптимизация: загружаем события и attendance один раз
+    all_events = get_all_events()
+    events_by_id = {e.get("event_id"): e for e in all_events}
+    w_attend = ws(SHEET_ATTEND)
+    attendance_rows = get_all_records(w_attend)
+
     lines = []
     for rt in rows:
         tcode = a2i(rt.get("type_code"))
         title = str(rt.get("title"))
-        attended = client_has_attended_type(cli["client_id"], tcode)
+        attended = client_has_attended_type(cli["client_id"], tcode, events_by_id, attendance_rows)
         flag = "✅ Був(ла)" if attended else "⭕️ Ще не був(ла)"
         lines.append(f"• {title} — {flag}")
     return text + "\n".join(lines)
@@ -251,11 +263,14 @@ def log_action(action: str, client_id: Optional[str] = None,
     except Exception:
         pass
 
-def has_log(action: str, client_id: str, event_id: str) -> bool:
+def has_log(action: str, client_id: str, event_id: str, log_rows: Optional[List[Dict[str, Any]]] = None) -> bool:
+    """Проверяет, есть ли запись в логе с заданными параметрами.
+    log_rows - опциональный список записей лога для оптимизации."""
     try:
-        w = ws(SHEET_LOG)
-        rows = get_all_records(w)
-        for r in rows:
+        if log_rows is None:
+            w = ws(SHEET_LOG)
+            log_rows = get_all_records(w)
+        for r in log_rows:
             if str(r.get("action")) == action and str(r.get("client_id")) == client_id and str(r.get("event_id")) == event_id:
                 return True
     except Exception:
@@ -435,11 +450,16 @@ def attendance_clear_for_event(event_id: str, mode: str = "zero") -> int:
     return touched
 
 
-def client_has_attended_type(client_id: str, type_code: int) -> bool:
-    events_by_id = {e.get("event_id"): e for e in get_all_events()}
-    w = ws(SHEET_ATTEND)
-    rows = get_all_records(w)
-    for r in rows:
+def client_has_attended_type(client_id: str, type_code: int, events_by_id: Optional[Dict[str, Dict[str, Any]]] = None, attendance_rows: Optional[List[Dict[str, Any]]] = None) -> bool:
+    """Проверяет, посещал ли клиент конференцию данного типа.
+    events_by_id - опциональный словарь {event_id: event} для оптимизации.
+    attendance_rows - опциональный список записей Attendance для оптимизации."""
+    if events_by_id is None:
+        events_by_id = {e.get("event_id"): e for e in get_all_events()}
+    if attendance_rows is None:
+        w = ws(SHEET_ATTEND)
+        attendance_rows = get_all_records(w)
+    for r in attendance_rows:
         if str(r.get("client_id")) == client_id and a2i(r.get("attended")) == 1:
             ev = events_by_id.get(str(r.get("event_id")))
             if ev and a2i(ev.get("type")) == int(type_code):
@@ -1274,25 +1294,53 @@ async def send_initial_invites_for_event(event: Dict[str, Any]):
     """Сразу рассылаем інвайт всем активным клиентам, кто не был на этом типе и не получал інвайт по этому event_id.
        Плюс антиспам: шлём только для ближайшего события этого типа и только если у клиента нет активного інвайта по типу.
     """
+    event_id = event.get("event_id", "unknown")
     dt = event_start_dt(event)
     if not dt:
+        log_action("invite_skip", client_id="", event_id=event_id, details="No valid datetime")
         return
 
+    # Загружаем все события ОДИН раз для оптимизации
+    all_events = get_all_events()
+
     # 1) Шлём інвайты только для ближайшей даты этого типа
-    if not is_earliest_upcoming_event_of_type(event):
+    if not is_earliest_upcoming_event_of_type(event, all_events):
+        log_action("invite_skip", client_id="", event_id=event_id, details="Not earliest event of type")
         return
 
     type_code = a2i(event.get("type"))
-    for cli in list_active_clients():
+    active_clients = list_active_clients()
+
+    # Создаём словарь событий по ID для оптимизации
+    events_by_id = {e.get("event_id"): e for e in all_events}
+
+    # Загружаем Attendance ОДИН раз для оптимизации
+    w_attend = ws(SHEET_ATTEND)
+    attendance_rows = get_all_records(w_attend)
+
+    # Загружаем лог ОДИН раз для оптимизации
+    w_log = ws(SHEET_LOG)
+    log_rows = get_all_records(w_log)
+
+    log_action("invite_process_start", client_id="", event_id=event_id, details=f"Processing {len(active_clients)} active clients, type={type_code}")
+
+    sent_count = 0
+    skip_reasons = {}
+
+    for cli in active_clients:
         cid = cli.get("client_id"); tg_id = cli.get("tg_user_id")
         if not cid or not tg_id:
+            skip_reasons["no_cid_or_tg"] = skip_reasons.get("no_cid_or_tg", 0) + 1
             continue
-        if client_has_attended_type(cid, type_code):
+        if client_has_attended_type(cid, type_code, events_by_id, attendance_rows):
+            skip_reasons["already_attended"] = skip_reasons.get("already_attended", 0) + 1
             continue
         # 2) Если у клиента уже есть "активный" інвайт по этому типу — не дублируем
-        if client_has_active_invite_for_type(cid, type_code):
+        if client_has_active_invite_for_type(cid, type_code, events_by_id):
+            skip_reasons["has_active_invite"] = skip_reasons.get("has_active_invite", 0) + 1
             continue
-        if has_log("invite_sent", cid, event["event_id"]):
+        if has_log("invite_sent", cid, event["event_id"], log_rows):
+            skip_reasons["already_sent"] = skip_reasons.get("already_sent", 0) + 1
             continue
 
         body = messages_get("invite.body").format(
@@ -1309,8 +1357,11 @@ async def send_initial_invites_for_event(event: Dict[str, Any]):
             # создаём/обновляем строку RSVP (пока без ответа)
             rsvp_upsert(event["event_id"], cid, rsvp="")
             log_action("invite_sent", client_id=cid, event_id=event["event_id"], details="immediate")
+            sent_count += 1
         except Exception as e:
-            log_action("invite_immediate_error", client_id=cid, event_id=event["event_id"], details=f"{e!r}")
+            log_action("invite_immediate_error", client_id=cid, event_id=event["event_id"], details=f"{type(e).__name__}: {str(e)}")
+
+    log_action("invite_process_complete", client_id="", event_id=event_id, details=f"Sent={sent_count}, Skipped={skip_reasons}")
 
 
 # =============================== SCHEDULER TICK ================================
@@ -1318,10 +1369,16 @@ async def send_initial_invites_for_event(event: Dict[str, Any]):
 async def scheduler_tick():
     now = now_kyiv()
 
-    REM_24H = 24*3600
-    REM_60M = 60*60
-    FEEDBACK_DELAY = 5*60   # или 2*60, если хочешь, как было
+    # ДЛЯ ТЕСТИРОВАНИЯ: уменьшенные интервалы
+    REM_24H = 3*60      # 3 минуты вместо 24 часов
+    REM_60M = 2*60      # 2 минуты вместо 1 часа
+    FEEDBACK_DELAY = 1*60   # 1 минута после окончания вместо 5 минут
     JITTER = 60             # секунды, допуск на тик раз в минуту
+
+    # ДЛЯ ПРОДАКШЕНА раскомментируй это:
+    # REM_24H = 24*3600
+    # REM_60M = 60*60
+    # FEEDBACK_DELAY = 5*60
 
     for e in list_future_events_sorted():
         dt = event_start_dt(e)
