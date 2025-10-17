@@ -1137,13 +1137,14 @@ async def route_low_feedback(event_id: str, client_id: str, stars: int, comment:
 
     # 1) Пытаемся в SUPPORT_CHAT_ID
     try:
-        msg = await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text, reply_markup=kb)
+        # Отключаем парсинг Markdown для сообщений с фидбеком
+        msg = await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text, reply_markup=kb, parse_mode=None)
         log_action("feedback_low_notified", client_id=client_id, event_id=event_id, details=f"support_chat:{SUPPORT_CHAT_ID}")
         return
     except TelegramRetryAfter as ex:
         await asyncio.sleep(ex.retry_after + 1)
         try:
-            msg = await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text, reply_markup=kb)
+            msg = await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text, reply_markup=kb, parse_mode=None)
             log_action("feedback_low_notified", client_id=client_id, event_id=event_id, details=f"support_chat:{SUPPORT_CHAT_ID}/after_retry")
             return
         except Exception as ex2:
@@ -1160,14 +1161,14 @@ async def route_low_feedback(event_id: str, client_id: str, stars: int, comment:
     if ADMINS:
         for admin_id in list(ADMINS):
             try:
-                await bot.send_message(chat_id=admin_id, text="(фолбэк) " + text, reply_markup=kb)
+                await bot.send_message(chat_id=admin_id, text="(фолбэк) " + text, reply_markup=kb, parse_mode=None)
                 log_action("feedback_low_notified_admin_dm", client_id=client_id, event_id=event_id, details=f"to_admin:{admin_id}")
             except Exception as ex:
                 log_action("feedback_low_admin_dm_fail", client_id=client_id, event_id=event_id, details=f"{admin_id}:{type(ex).__name__}")
 
 
 async def route_low_feedback_comment_update(event_id: str, client_id: str, comment: str):
-    # короткая “добавка” к уже отправленной скарге
+    # короткая "добавка" к уже отправленной скарге
     cli_tg = try_get_tg_from_client_id(client_id)
     event = get_event_by_id(event_id) or {}
     text = (
@@ -1177,7 +1178,8 @@ async def route_low_feedback_comment_update(event_id: str, client_id: str, comme
         f"• Коментар: {comment or '—'}"
     )
     try:
-        await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text)
+        # Отключаем парсинг Markdown
+        await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text, parse_mode=None)
         log_action("low_fb_comment_update_sent", client_id=client_id, event_id=event_id, details="")
     except Exception as e:
         log_action("support_send_error", client_id=client_id, event_id=event_id, details=f"{e!r}")
