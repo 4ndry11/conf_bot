@@ -10,6 +10,8 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, Teleg
 
 import gspread
 from gspread.utils import rowcol_to_a1
+from gspread.exceptions import APIError
+import time
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -57,8 +59,19 @@ def ws_headers(w: gspread.Worksheet) -> List[str]:
     row = w.row_values(1)
     return [h.strip() for h in row]
 
-def get_all_records(w: gspread.Worksheet) -> List[Dict[str, Any]]:
-    return w.get_all_records(expected_headers=ws_headers(w), default_blank="")
+def get_all_records(w: gspread.Worksheet, retries: int = 3) -> List[Dict[str, Any]]:
+    """Получает все записи с retry при ошибке 429."""
+    for attempt in range(retries):
+        try:
+            return w.get_all_records(expected_headers=ws_headers(w), default_blank="")
+        except APIError as e:
+            if "429" in str(e) or "Quota exceeded" in str(e):
+                if attempt < retries - 1:
+                    wait_time = (attempt + 1) * 2  # 2, 4, 6 секунд
+                    time.sleep(wait_time)
+                    continue
+            raise
+    return []
 
 def find_row_by_value(w: gspread.Worksheet, column_name: str, value: Any) -> Optional[int]:
     headers = ws_headers(w)
@@ -97,6 +110,33 @@ def delete_row(w: gspread.Worksheet, row_idx: int) -> None:
     w.delete_rows(row_idx)
 
 # =============================== HELPERS =======================================
+
+# Кэш для уменьшения запросов к Google Sheets API
+_CACHE: Dict[str, Any] = {}
+_CACHE_TTL = 30  # seconds
+
+def _cache_key(sheet_name: str, suffix: str = "") -> str:
+    return f"{sheet_name}:{suffix}" if suffix else sheet_name
+
+def _get_cached(key: str) -> Optional[Any]:
+    if key in _CACHE:
+        data, ts = _CACHE[key]
+        if (datetime.now().timestamp() - ts) < _CACHE_TTL:
+            return data
+    return None
+
+def _set_cache(key: str, data: Any):
+    _CACHE[key] = (data, datetime.now().timestamp())
+
+def _invalidate_cache(sheet_name: str):
+    """Инвалидирует весь кэш для конкретного листа."""
+    keys_to_remove = [k for k in _CACHE.keys() if k.startswith(f"{sheet_name}:")]
+    for k in keys_to_remove:
+        del _CACHE[k]
+
+# Батч-накопитель для логов
+_LOG_BATCH: List[Dict[str, Any]] = []
+_LOG_BATCH_SIZE = 20  # записываем батчами по 20 строк
 
 async def safe_edit_message(message: Message, text: str, reply_markup=None, parse_mode=None):
     """Безопасное редактирование сообщения с обработкой ошибки 'message is not modified'."""
@@ -259,17 +299,43 @@ def messages_get(key: str, lang: str = "uk") -> str:
 
 def log_action(action: str, client_id: Optional[str] = None,
                event_id: Optional[str] = None, details: str = "") -> None:
+    """Добавляет лог в батч. Батч будет записан автоматически при достижении размера или вызове flush_logs()."""
+    global _LOG_BATCH
+    _LOG_BATCH.append({
+        "ts": now_kyiv().strftime("%Y-%m-%d %H:%M:%S"),
+        "client_id": client_id or "",
+        "event_id": event_id or "",
+        "action": action,
+        "details": details or "",
+    })
+    # Автоматически сбрасываем, если накопилось достаточно
+    if len(_LOG_BATCH) >= _LOG_BATCH_SIZE:
+        flush_logs()
+
+def flush_logs() -> None:
+    """Записывает все накопленные логи в Google Sheets одним батчем."""
+    global _LOG_BATCH
+    if not _LOG_BATCH:
+        return
     try:
         w = ws(SHEET_LOG)
-        append_dict(w, {
-            "ts": now_kyiv().strftime("%Y-%m-%d %H:%M:%S"),
-            "client_id": client_id or "",
-            "event_id": event_id or "",
-            "action": action,
-            "details": details or "",
-        })
-    except Exception:
-        pass
+        headers = ws_headers(w)
+        # Готовим все строки для батч-записи
+        rows = []
+        for log_entry in _LOG_BATCH:
+            row = [str(log_entry.get(h, "")) if log_entry.get(h, "") is not None else "" for h in headers]
+            rows.append(row)
+        # Записываем все строки одним запросом
+        if rows:
+            w.append_rows(rows, value_input_option="USER_ENTERED")
+        _LOG_BATCH = []
+    except Exception as e:
+        # В случае ошибки сохраняем логи в файл для отладки
+        import json
+        with open("/tmp/failed_logs.json", "a") as f:
+            json.dump(_LOG_BATCH, f)
+            f.write("\n")
+        _LOG_BATCH = []
 
 def has_log(action: str, client_id: str, event_id: str, log_rows: Optional[List[Dict[str, Any]]] = None) -> bool:
     """Проверяет, есть ли запись в логе с заданными параметрами.
@@ -339,9 +405,15 @@ def touch_client_seen(tg_user_id: int) -> None:
         update_cell(w, row, "last_seen_at", iso_dt())
 
 def list_active_clients() -> List[Dict[str, Any]]:
+    cache_key = _cache_key(SHEET_CLIENTS, "active")
+    cached = _get_cached(cache_key)
+    if cached is not None:
+        return cached
     w = ws(SHEET_CLIENTS)
     rows = get_all_records(w)
-    return [r for r in rows if str(r.get("status", "")).strip().lower() == "active"]
+    result = [r for r in rows if str(r.get("status", "")).strip().lower() == "active"]
+    _set_cache(cache_key, result)
+    return result
 
 def create_event(type_code: int, title: str, description: str, start_at: str,
                  duration_min: int, link: str, created_by: str) -> Dict[str, Any]:
@@ -359,12 +431,19 @@ def create_event(type_code: int, title: str, description: str, start_at: str,
         "created_at": iso_dt(),
     }
     append_dict(w, payload)
+    _invalidate_cache(SHEET_EVENTS)
     log_action("event_created", client_id=None, event_id=event_id, details=f"type={type_code}")
     return payload
 
 def get_all_events() -> List[Dict[str, Any]]:
+    cache_key = _cache_key(SHEET_EVENTS, "all")
+    cached = _get_cached(cache_key)
+    if cached is not None:
+        return cached
     w = ws(SHEET_EVENTS)
-    return get_all_records(w)
+    result = get_all_records(w)
+    _set_cache(cache_key, result)
+    return result
 
 def get_event_by_id(event_id: str) -> Optional[Dict[str, Any]]:
     for r in get_all_events():
@@ -1472,100 +1551,118 @@ async def send_initial_invites_for_event(event: Dict[str, Any]):
             skip_reasons["other_error"] = skip_reasons.get("other_error", 0) + 1
 
     log_action("invite_process_complete", client_id="", event_id=event_id, details=f"Sent={sent_count}, Skipped={skip_reasons}")
+    flush_logs()  # Принудительно записываем все накопленные логи
 
 
 # =============================== SCHEDULER TICK ================================
 
 async def scheduler_tick():
-    now = now_kyiv()
+    try:
+        now = now_kyiv()
 
-    # ДЛЯ ТЕСТИРОВАНИЯ: уменьшенные интервалы
-    REM_24H = 3*60      # 3 минуты вместо 24 часов
-    REM_60M = 2*60      # 2 минуты вместо 1 часа
-    FEEDBACK_DELAY = 1*60   # 1 минута после окончания вместо 5 минут
-    JITTER = 60             # секунды, допуск на тик раз в минуту
+        # ДЛЯ ТЕСТИРОВАНИЯ: уменьшенные интервалы
+        REM_24H = 3*60      # 3 минуты вместо 24 часов
+        REM_60M = 2*60      # 2 минуты вместо 1 часа
+        FEEDBACK_DELAY = 1*60   # 1 минута после окончания вместо 5 минут
+        JITTER = 60             # секунды, допуск на тик раз в минуту
 
-    # ДЛЯ ПРОДАКШЕНА раскомментируй это:
-    # REM_24H = 24*3600
-    # REM_60M = 60*60
-    # FEEDBACK_DELAY = 5*60
+        # ДЛЯ ПРОДАКШЕНА раскомментируй это:
+        # REM_24H = 24*3600
+        # REM_60M = 60*60
+        # FEEDBACK_DELAY = 5*60
 
-    for e in list_future_events_sorted():
-        dt = event_start_dt(e)
-        if not dt:
-            continue
-
-        diff = (dt - now).total_seconds()  # до старта, сек
-
-        # === Напоминание за 24 часа ===
-        if abs(diff - REM_24H) <= JITTER:
-            for r in rsvp_get_for_event(e["event_id"]):
-                cid = r.get("client_id")
-                tg_id = try_get_tg_from_client_id(cid)
-                if not tg_id:
-                    continue
-                if a2i(r.get("reminded_24h"), 0) == 1:
-                    continue
-                if str(r.get("rsvp")) == "going":
-                    body = messages_get("reminder.24h").format(
-                        title=e["title"], time=fmt_time(dt), link=e["link"]
-                    )
-                    try:
-                        await bot.send_message(chat_id=int(tg_id), text=body)
-                        rsvp_upsert(e["event_id"], cid, reminded_24h=1)
-                        log_action("remind_24h_sent", client_id=cid, event_id=e["event_id"], details="prod_24h")
-                    except Exception:
-                        pass
-
-        # === Напоминание за 60 минут ===
-        if abs(diff - REM_60M) <= JITTER:
-            for r in rsvp_get_for_event(e["event_id"]):
-                cid = r.get("client_id")
-                tg_id = try_get_tg_from_client_id(cid)
-                if not tg_id:
-                    continue
-                if a2i(r.get("reminded_60m"), 0) == 1:
-                    continue
-                if str(r.get("rsvp")) == "going":
-                    body = messages_get("reminder.60m").format(title=e["title"], link=e["link"])
-                    try:
-                        await bot.send_message(chat_id=int(tg_id), text=body)
-                        rsvp_upsert(e["event_id"], cid, reminded_60m=1)
-                        log_action("remind_60m_sent", client_id=cid, event_id=e["event_id"], details="prod_60m")
-                    except Exception:
-                        pass
-
-        # === Фидбэк спустя FEEDBACK_DELAY после окончания ===
-        end_dt = dt + timedelta(minutes=a2i(e.get("duration_min")))
-        post_end = (now - end_dt).total_seconds()
-        if abs(post_end - FEEDBACK_DELAY) <= JITTER:
-            if has_log("feedback_requested", client_id="", event_id=e["event_id"]):
+        for e in list_future_events_sorted():
+            dt = event_start_dt(e)
+            if not dt:
                 continue
 
-            w_att = ws(SHEET_ATTEND)
-            rows_att = get_all_records(w_att)
-            for r in rows_att:
-                if str(r.get("event_id")) == e["event_id"] and a2i(r.get("attended")) == 1:
+            diff = (dt - now).total_seconds()  # до старта, сек
+
+            # === Напоминание за 24 часа ===
+            if abs(diff - REM_24H) <= JITTER:
+                for r in rsvp_get_for_event(e["event_id"]):
                     cid = r.get("client_id")
                     tg_id = try_get_tg_from_client_id(cid)
                     if not tg_id:
                         continue
-                    text = messages_get("feedback.ask").format(title=e["title"])
-                    kb = InlineKeyboardMarkup(inline_keyboard=[[
-                        InlineKeyboardButton(text="⭐️1", callback_data=f"fb:{e['event_id']}:{cid}:1"),
-                        InlineKeyboardButton(text="⭐️2", callback_data=f"fb:{e['event_id']}:{cid}:2"),
-                        InlineKeyboardButton(text="⭐️3", callback_data=f"fb:{e['event_id']}:{cid}:3"),
-                        InlineKeyboardButton(text="⭐️4", callback_data=f"fb:{e['event_id']}:{cid}:4"),
-                        InlineKeyboardButton(text="⭐️5", callback_data=f"fb:{e['event_id']}:{cid}:5"),
-                    ]])
-                    try:
-                        await bot.send_message(chat_id=int(tg_id), text=text, reply_markup=kb)
-                    except Exception:
-                        pass
+                    if a2i(r.get("reminded_24h"), 0) == 1:
+                        continue
+                    if str(r.get("rsvp")) == "going":
+                        body = messages_get("reminder.24h").format(
+                            title=e["title"], time=fmt_time(dt), link=e["link"]
+                        )
+                        try:
+                            await bot.send_message(chat_id=int(tg_id), text=body)
+                            rsvp_upsert(e["event_id"], cid, reminded_24h=1)
+                            log_action("remind_24h_sent", client_id=cid, event_id=e["event_id"], details="prod_24h")
+                        except Exception:
+                            pass
 
-            log_action("feedback_requested", client_id="", event_id=e["event_id"], details=f"delay={FEEDBACK_DELAY}")
+            # === Напоминание за 60 минут ===
+            if abs(diff - REM_60M) <= JITTER:
+                for r in rsvp_get_for_event(e["event_id"]):
+                    cid = r.get("client_id")
+                    tg_id = try_get_tg_from_client_id(cid)
+                    if not tg_id:
+                        continue
+                    if a2i(r.get("reminded_60m"), 0) == 1:
+                        continue
+                    if str(r.get("rsvp")) == "going":
+                        body = messages_get("reminder.60m").format(title=e["title"], link=e["link"])
+                        try:
+                            await bot.send_message(chat_id=int(tg_id), text=body)
+                            rsvp_upsert(e["event_id"], cid, reminded_60m=1)
+                            log_action("remind_60m_sent", client_id=cid, event_id=e["event_id"], details="prod_60m")
+                        except Exception:
+                            pass
 
+            # === Фидбэк спустя FEEDBACK_DELAY после окончания ===
+            end_dt = dt + timedelta(minutes=a2i(e.get("duration_min")))
+            post_end = (now - end_dt).total_seconds()
+            if abs(post_end - FEEDBACK_DELAY) <= JITTER:
+                if has_log("feedback_requested", client_id="", event_id=e["event_id"]):
+                    continue
 
+                w_att = ws(SHEET_ATTEND)
+                rows_att = get_all_records(w_att)
+                for r in rows_att:
+                    if str(r.get("event_id")) == e["event_id"] and a2i(r.get("attended")) == 1:
+                        cid = r.get("client_id")
+                        tg_id = try_get_tg_from_client_id(cid)
+                        if not tg_id:
+                            continue
+                        text = messages_get("feedback.ask").format(title=e["title"])
+                        kb = InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(text="⭐️1", callback_data=f"fb:{e['event_id']}:{cid}:1"),
+                            InlineKeyboardButton(text="⭐️2", callback_data=f"fb:{e['event_id']}:{cid}:2"),
+                            InlineKeyboardButton(text="⭐️3", callback_data=f"fb:{e['event_id']}:{cid}:3"),
+                            InlineKeyboardButton(text="⭐️4", callback_data=f"fb:{e['event_id']}:{cid}:4"),
+                            InlineKeyboardButton(text="⭐️5", callback_data=f"fb:{e['event_id']}:{cid}:5"),
+                        ]])
+                        try:
+                            await bot.send_message(chat_id=int(tg_id), text=text, reply_markup=kb)
+                        except Exception:
+                            pass
+
+                log_action("feedback_requested", client_id="", event_id=e["event_id"], details=f"delay={FEEDBACK_DELAY}")
+
+        # Сбрасываем накопленные логи в конце каждого тика
+        flush_logs()
+
+    except APIError as e:
+        if "429" in str(e) or "Quota exceeded" in str(e):
+            # Квота превышена - пропускаем этот тик, попробуем в следующий раз
+            flush_logs()  # Все равно пытаемся записать логи
+            pass
+        else:
+            # Другая ошибка API - логируем
+            import traceback
+            print(f"API Error in scheduler_tick: {e}\n{traceback.format_exc()}")
+    except Exception as e:
+        # Любая другая ошибка - не роняем scheduler
+        import traceback
+        print(f"Error in scheduler_tick: {e}\n{traceback.format_exc()}")
+        flush_logs()
 
 
 # ================================ STARTUP ======================================
