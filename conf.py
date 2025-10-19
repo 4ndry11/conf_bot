@@ -327,9 +327,9 @@ async def list_future_events_sorted() -> List[Dict[str, Any]]:
     now = now_kyiv()
     one_day_ago = now - timedelta(days=1)
     async with db_pool.acquire() as conn:
-        # Используем CAST для явного приведения типа timestamp
+        # Убираем ::timestamp cast - asyncpg корректно обрабатывает aware datetime для TIMESTAMPTZ
         rows = await conn.fetch(
-            "SELECT * FROM events WHERE start_at >= $1::timestamp ORDER BY start_at",
+            "SELECT * FROM events WHERE start_at >= $1 ORDER BY start_at",
             one_day_ago
         )
         result = []
@@ -345,7 +345,7 @@ async def list_alternative_events_same_type(type_code: int, exclude_event_id: in
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT * FROM events
-               WHERE type = $1 AND event_id != $2 AND start_at >= $3::timestamp
+               WHERE type = $1 AND event_id != $2 AND start_at >= $3
                ORDER BY start_at""",
             type_code, exclude_event_id, now
         )
@@ -459,7 +459,7 @@ async def client_has_active_invite_for_type(client_id: int, type_code: int) -> b
                JOIN events e ON r.event_id = e.event_id
                WHERE r.client_id = $1
                  AND e.type = $2
-                 AND e.start_at >= $3::timestamp
+                 AND e.start_at >= $3
                  AND (r.rsvp = '' OR r.rsvp = 'going')
                LIMIT 1""",
             client_id, type_code, now
@@ -478,7 +478,7 @@ async def is_earliest_upcoming_event_of_type(event: Dict[str, Any]) -> bool:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             """SELECT event_id FROM events
-               WHERE type = $1 AND start_at >= $2::timestamp
+               WHERE type = $1 AND start_at >= $2
                ORDER BY start_at
                LIMIT 1""",
             event_type, now
