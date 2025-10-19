@@ -34,9 +34,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
 
-SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", ""))
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", "-1003053461710"))
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "f7T9vQ1111wLp2Gx8Z")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://admin:HixmeIYPVRXhhqDDn2k96ozPQdwjHWVJ@dpg-d3qc93odl3ps73bqudv0-a.frankfurt-postgres.render.com/db_zv_conf")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
 TZ = ZoneInfo(TIMEZONE)
 
@@ -72,15 +72,21 @@ async def safe_edit_message(message: Message, text: str, reply_markup=None, pars
             raise
 
 def now_kyiv() -> datetime:
-    return datetime.now(TZ)
+    """Возвращает текущее время в timezone Киева БЕЗ timezone info (naive)
+    PostgreSQL TIMESTAMP WITHOUT TIMEZONE требует naive datetime"""
+    # Используем localize вместо now(TZ) для корректной работы с ZoneInfo
+    naive_utc = datetime.utcnow()
+    aware_kyiv = naive_utc.replace(tzinfo=ZoneInfo('UTC')).astimezone(TZ)
+    return aware_kyiv.replace(tzinfo=None)
 
 def iso_dt(dt: Optional[datetime] = None) -> str:
     dt = dt or now_kyiv()
     return dt.strftime("%Y-%m-%d %H:%M")
 
 def parse_dt(s: str) -> Optional[datetime]:
+    """Парсит строку в naive datetime (без timezone info)"""
     try:
-        return datetime.strptime(s.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+        return datetime.strptime(s.strip(), "%Y-%m-%d %H:%M")
     except Exception:
         return None
 
@@ -292,10 +298,11 @@ async def delete_event(event_id: int) -> None:
         await log_action("event_canceled", event_id=event_id, details="deleted")
 
 def event_start_dt(event: Dict[str, Any]) -> Optional[datetime]:
-    """Получение datetime начала события"""
+    """Получение datetime начала события (naive datetime)"""
     start_at = event.get("start_at")
     if isinstance(start_at, datetime):
-        return start_at.replace(tzinfo=TZ) if start_at.tzinfo is None else start_at
+        # Убираем timezone info если есть
+        return start_at.replace(tzinfo=None) if start_at.tzinfo else start_at
     if isinstance(start_at, str):
         return parse_dt(start_at)
     return None
@@ -303,10 +310,12 @@ def event_start_dt(event: Dict[str, Any]) -> Optional[datetime]:
 async def list_future_events_sorted() -> List[Dict[str, Any]]:
     """Получение будущих событий, отсортированных по дате"""
     now = now_kyiv()
+    one_day_ago = now - timedelta(days=1)
     async with db_pool.acquire() as conn:
+        # Используем CAST для явного приведения типа timestamp
         rows = await conn.fetch(
-            "SELECT * FROM events WHERE start_at >= $1 - INTERVAL '1 day' ORDER BY start_at",
-            now
+            "SELECT * FROM events WHERE start_at >= $1::timestamp ORDER BY start_at",
+            one_day_ago
         )
         result = []
         for row in rows:
@@ -321,7 +330,7 @@ async def list_alternative_events_same_type(type_code: int, exclude_event_id: in
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT * FROM events
-               WHERE type = $1 AND event_id != $2 AND start_at >= $3
+               WHERE type = $1 AND event_id != $2 AND start_at >= $3::timestamp
                ORDER BY start_at""",
             type_code, exclude_event_id, now
         )
@@ -435,7 +444,7 @@ async def client_has_active_invite_for_type(client_id: int, type_code: int) -> b
                JOIN events e ON r.event_id = e.event_id
                WHERE r.client_id = $1
                  AND e.type = $2
-                 AND e.start_at >= $3
+                 AND e.start_at >= $3::timestamp
                  AND (r.rsvp = '' OR r.rsvp = 'going')
                LIMIT 1""",
             client_id, type_code, now
@@ -454,7 +463,7 @@ async def is_earliest_upcoming_event_of_type(event: Dict[str, Any]) -> bool:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             """SELECT event_id FROM events
-               WHERE type = $1 AND start_at >= $2
+               WHERE type = $1 AND start_at >= $2::timestamp
                ORDER BY start_at
                LIMIT 1""",
             event_type, now
