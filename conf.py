@@ -34,9 +34,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
 
-SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", "-1003053461710"))
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "f7T9vQ1111wLp2Gx8Z")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://admin:HixmeIYPVRXhhqDDn2k96ozPQdwjHWVJ@dpg-d3qc93odl3ps73bqudv0-a.frankfurt-postgres.render.com/db_zv_conf")
+SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", ""))
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
 TZ = ZoneInfo(TIMEZONE)
 
@@ -72,21 +72,23 @@ async def safe_edit_message(message: Message, text: str, reply_markup=None, pars
             raise
 
 def now_kyiv() -> datetime:
-    """Возвращает текущее время в timezone Киева БЕЗ timezone info (naive)
-    PostgreSQL TIMESTAMP WITHOUT TIMEZONE требует naive datetime"""
-    # Используем localize вместо now(TZ) для корректной работы с ZoneInfo
-    naive_utc = datetime.utcnow()
-    aware_kyiv = naive_utc.replace(tzinfo=ZoneInfo('UTC')).astimezone(TZ)
-    return aware_kyiv.replace(tzinfo=None)
+    """Возвращает текущее время в timezone Киева С timezone info (aware)
+    PostgreSQL TIMESTAMPTZ корректно обрабатывает aware datetime"""
+    from datetime import timezone as tz_module
+    utc_now = datetime.now(tz_module.utc)
+    # Конвертируем в киевское время и возвращаем aware datetime
+    return utc_now.astimezone(TZ)
 
 def iso_dt(dt: Optional[datetime] = None) -> str:
     dt = dt or now_kyiv()
     return dt.strftime("%Y-%m-%d %H:%M")
 
 def parse_dt(s: str) -> Optional[datetime]:
-    """Парсит строку в naive datetime (без timezone info)"""
+    """Парсит строку в aware datetime (с timezone info для Киева)"""
     try:
-        return datetime.strptime(s.strip(), "%Y-%m-%d %H:%M")
+        naive_dt = datetime.strptime(s.strip(), "%Y-%m-%d %H:%M")
+        # Локализуем в киевскую зону
+        return naive_dt.replace(tzinfo=TZ)
     except Exception:
         return None
 
@@ -298,11 +300,11 @@ async def delete_event(event_id: int) -> None:
         await log_action("event_canceled", event_id=event_id, details="deleted")
 
 def event_start_dt(event: Dict[str, Any]) -> Optional[datetime]:
-    """Получение datetime начала события (naive datetime)"""
+    """Получение datetime начала события (aware datetime)"""
     start_at = event.get("start_at")
     if isinstance(start_at, datetime):
-        # Убираем timezone info если есть
-        return start_at.replace(tzinfo=None) if start_at.tzinfo else start_at
+        # Если есть timezone info — возвращаем как есть, иначе локализуем
+        return start_at if start_at.tzinfo else start_at.replace(tzinfo=TZ)
     if isinstance(start_at, str):
         return parse_dt(start_at)
     return None
