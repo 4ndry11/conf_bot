@@ -8,10 +8,8 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
-import gspread
-from gspread.utils import rowcol_to_a1
-from gspread.exceptions import APIError
-import time
+import asyncpg
+from asyncpg import Pool
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -27,116 +25,43 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton,  # <-- добавь эти два
+    ReplyKeyboardMarkup, KeyboardButton,
 )
+
 # =============================== CONFIG =======================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
 
-SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", "-1003053461710"))
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "f7T9vQ1111wLp2Gx8Z")
-SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "Conference ZVILNYMO")
+SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", ""))
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
-GOOGLE_SA_PATH = os.getenv("GOOGLE_SA_PATH", "/etc/secrets/gsheets.json")
 TZ = ZoneInfo(TIMEZONE)
 
-# =========================== SHEETS CONNECTION =================================
+# ========================== DATABASE CONNECTION ================================
 
-def _open_gsheet() -> gspread.Spreadsheet:
-    if not os.path.exists(GOOGLE_SA_PATH):
-        raise RuntimeError(f"Google SA file not found: {GOOGLE_SA_PATH}")
-    sa = gspread.service_account(filename=GOOGLE_SA_PATH)
-    return sa.open(SPREADSHEET_NAME)
+db_pool: Optional[Pool] = None
 
-GS = _open_gsheet()
+async def init_db():
+    """Инициализация пула подключений к базе данных"""
+    global db_pool
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=2,
+        max_size=10,
+        command_timeout=60
+    )
+    return db_pool
 
-def ws(name: str) -> gspread.Worksheet:
-    return GS.worksheet(name)
-
-def ws_headers(w: gspread.Worksheet) -> List[str]:
-    row = w.row_values(1)
-    return [h.strip() for h in row]
-
-def get_all_records(w: gspread.Worksheet, retries: int = 3) -> List[Dict[str, Any]]:
-    """Получает все записи с retry при ошибке 429."""
-    for attempt in range(retries):
-        try:
-            return w.get_all_records(expected_headers=ws_headers(w), default_blank="")
-        except APIError as e:
-            if "429" in str(e) or "Quota exceeded" in str(e):
-                if attempt < retries - 1:
-                    wait_time = (attempt + 1) * 2  # 2, 4, 6 секунд
-                    time.sleep(wait_time)
-                    continue
-            raise
-    return []
-
-def find_row_by_value(w: gspread.Worksheet, column_name: str, value: Any) -> Optional[int]:
-    headers = ws_headers(w)
-    if column_name not in headers:
-        return None
-    col_idx = headers.index(column_name) + 1
-    col_vals = w.col_values(col_idx)
-    for i, v in enumerate(col_vals, start=1):
-        if i == 1:
-            continue
-        if str(v).strip() == str(value).strip():
-            return i
-    return None
-
-def append_dict(w: gspread.Worksheet, data: Dict[str, Any]) -> None:
-    headers = ws_headers(w)
-    row = [str(data.get(h, "")) if data.get(h, "") is not None else "" for h in headers]
-    w.append_row(row, value_input_option="USER_ENTERED")
-
-def update_row_dict(w: gspread.Worksheet, row_idx: int, data: Dict[str, Any]) -> None:
-    headers = ws_headers(w)
-    row = [str(data.get(h, "")) if data.get(h, "") is not None else "" for h in headers]
-    start_a1 = rowcol_to_a1(row_idx, 1)
-    end_a1 = rowcol_to_a1(row_idx, len(headers))
-    rng = f"{start_a1}:{end_a1}"
-    w.update(rng, [row], value_input_option="USER_ENTERED")
-
-def update_cell(w: gspread.Worksheet, row_idx: int, column_name: str, value: Any) -> None:
-    headers = ws_headers(w)
-    if column_name not in headers:
-        return
-    col_idx = headers.index(column_name) + 1
-    w.update_cell(row_idx, col_idx, str(value) if value is not None else "")
-
-def delete_row(w: gspread.Worksheet, row_idx: int) -> None:
-    w.delete_rows(row_idx)
+async def close_db():
+    """Закрытие пула подключений"""
+    global db_pool
+    if db_pool:
+        await db_pool.close()
 
 # =============================== HELPERS =======================================
-
-# Кэш для уменьшения запросов к Google Sheets API
-_CACHE: Dict[str, Any] = {}
-_CACHE_TTL = 30  # seconds
-
-def _cache_key(sheet_name: str, suffix: str = "") -> str:
-    return f"{sheet_name}:{suffix}" if suffix else sheet_name
-
-def _get_cached(key: str) -> Optional[Any]:
-    if key in _CACHE:
-        data, ts = _CACHE[key]
-        if (datetime.now().timestamp() - ts) < _CACHE_TTL:
-            return data
-    return None
-
-def _set_cache(key: str, data: Any):
-    _CACHE[key] = (data, datetime.now().timestamp())
-
-def _invalidate_cache(sheet_name: str):
-    """Инвалидирует весь кэш для конкретного листа."""
-    keys_to_remove = [k for k in _CACHE.keys() if k.startswith(f"{sheet_name}:")]
-    for k in keys_to_remove:
-        del _CACHE[k]
-
-# Батч-накопитель для логов
-_LOG_BATCH: List[Dict[str, Any]] = []
-_LOG_BATCH_SIZE = 20  # записываем батчами по 20 строк
 
 async def safe_edit_message(message: Message, text: str, reply_markup=None, parse_mode=None):
     """Безопасное редактирование сообщения с обработкой ошибки 'message is not modified'."""
@@ -180,111 +105,27 @@ def normalize_phone(raw: str) -> Optional[str]:
         return "380" + digits
     return None
 
-def rsvp_get_for_event_ids_for_client(client_id: str) -> List[Dict[str, Any]]:
-    w = ws(SHEET_RSVP)
-    return [r for r in get_all_records(w) if str(r.get("client_id")) == str(client_id)]
-
 def a2i(v: Any, default: int = 0) -> int:
     try:
-        return int(str(v).strip())
+        return int(str(v).strip()) if v is not None else default
     except Exception:
         return default
-def is_earliest_upcoming_event_of_type(event: Dict[str, Any], all_events: Optional[List[Dict[str, Any]]] = None) -> bool:
-    """True, если это ближайшее (по времени) будущее событие данного type.
-    all_events - опциональный список всех событий для оптимизации (чтобы не читать Google Sheets каждый раз)."""
-    now = now_kyiv()
-    etype = a2i(event.get("type"))
-    dt_this = event_start_dt(event)
-    if not dt_this:
-        return False
-    # Используем переданный список или загружаем заново
-    events = all_events if all_events is not None else get_all_events()
-    # Собираем все будущие события этого типа и проверяем, что текущее — самое раннее.
-    cands: List[Tuple[datetime, Dict[str, Any]]] = []
-    for e in events:
-        if a2i(e.get("type")) != etype:
-            continue
-        dt = event_start_dt(e)
-        if dt and dt >= now:
-            cands.append((dt, e))
-    if not cands:
-        return False
-    cands.sort(key=lambda x: x[0])
-    return cands[0][1].get("event_id") == event.get("event_id")
 
+# =============================== DATABASE LAYER ==================================
 
-def client_has_active_invite_for_type(client_id: str, type_code: int, events_by_id: Optional[Dict[str, Dict[str, Any]]] = None) -> bool:
-    """
-    Есть ли у клиента 'активная' запись на событие этого типа в будущем:
-    - запись в RSVP по событию этого типа и
-    - RSVP в состоянии "" (ещё не ответил) или "going".
-    events_by_id - опциональный словарь {event_id: event} для оптимизации.
-    """
-    now = now_kyiv()
-    # Используем переданный словарь или создаём заново
-    if events_by_id is None:
-        events_by_id = {e.get("event_id"): e for e in get_all_events()}
-    for r in rsvp_get_for_event_ids_for_client(client_id):
-        ev = events_by_id.get(str(r.get("event_id")))
-        if not ev:
-            continue
-        if a2i(ev.get("type")) != int(type_code):
-            continue
-        dt = event_start_dt(ev)
-        if not dt or dt < now:
-            continue
-        rsvp_val = str(r.get("rsvp") or "")
-        if rsvp_val in {"", "going"}:
-            return True
-    return False
-
-def build_types_overview_text(cli: Dict[str, Any]) -> str:
-    text = (
-        "✅ Ви підключені до розсилки на конференції.\n"
-        "Надсилатимемо інвайти на найближчі події.\n\n"
-        "Доступні типи конференцій:\n"
-    )
-    rows = get_eventtypes_active()
-    if not rows:
-        return text + "Наразі немає активних типів."
-
-    # Оптимизация: загружаем события и attendance один раз
-    all_events = get_all_events()
-    events_by_id = {e.get("event_id"): e for e in all_events}
-    w_attend = ws(SHEET_ATTEND)
-    attendance_rows = get_all_records(w_attend)
-
-    lines = []
-    for rt in rows:
-        tcode = a2i(rt.get("type_code"))
-        title = str(rt.get("title"))
-        attended = client_has_attended_type(cli["client_id"], tcode, events_by_id, attendance_rows)
-        flag = "✅ Був(ла)" if attended else "⭕️ Ще не був(ла)"
-        lines.append(f"• {title} — {flag}")
-    return text + "\n".join(lines)
-
-# =============================== SHEET NAMES ===================================
-
-SHEET_EVENTTYPES = "EventTypes"
-SHEET_CLIENTS    = "Clients"
-SHEET_EVENTS     = "Events"
-SHEET_ATTEND     = "Attendance"
-SHEET_LOG        = "DeliveryLog"
-SHEET_FEEDBACK   = "Feedback"
-SHEET_MSG        = "Messages"
-SHEET_RSVP       = "RSVP"
-
-# =============================== DOMAIN LAYER ==================================
-
-def messages_get(key: str, lang: str = "uk") -> str:
+async def messages_get(key: str, lang: str = "uk") -> str:
+    """Получение сообщения из БД по ключу"""
     try:
-        w = ws(SHEET_MSG)
-        rows = get_all_records(w)
-        for r in rows:
-            if str(r.get("key")).strip() == key and str(r.get("lang", "uk")).strip() == lang:
-                return str(r.get("text", "")).replace("\\n", "\n")
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT text FROM messages WHERE key = $1 AND lang = $2",
+                key, lang
+            )
+            if row:
+                return str(row['text']).replace("\\n", "\n")
     except Exception:
         pass
+
     FALLBACKS = {
         "invite.title": "Запрошення на зустріч: {title}",
         "invite.body": "{name}, запрошуємо на зустріч: {title}\n🗓 {date} о {time} (Київ)\nℹ️ {description}\nВиберіть варіант нижче:\n[✅ Так, буду] [🚫 Не зможу] [🔔 Нагадати за 24 год]",
@@ -297,385 +138,437 @@ def messages_get(key: str, lang: str = "uk") -> str:
     }
     return FALLBACKS.get(key, "")
 
-def log_action(action: str, client_id: Optional[str] = None,
-               event_id: Optional[str] = None, details: str = "") -> None:
-    """Добавляет лог в батч. Батч будет записан автоматически при достижении размера или вызове flush_logs()."""
-    global _LOG_BATCH
-    _LOG_BATCH.append({
-        "ts": now_kyiv().strftime("%Y-%m-%d %H:%M:%S"),
-        "client_id": client_id or "",
-        "event_id": event_id or "",
-        "action": action,
-        "details": details or "",
-    })
-    # Автоматически сбрасываем, если накопилось достаточно
-    if len(_LOG_BATCH) >= _LOG_BATCH_SIZE:
-        flush_logs()
-
-def flush_logs() -> None:
-    """Записывает все накопленные логи в Google Sheets одним батчем."""
-    global _LOG_BATCH
-    if not _LOG_BATCH:
-        return
+async def log_action(action: str, client_id: Optional[int] = None,
+               event_id: Optional[int] = None, details: str = "") -> None:
+    """Запись действия в лог"""
     try:
-        w = ws(SHEET_LOG)
-        headers = ws_headers(w)
-        # Готовим все строки для батч-записи
-        rows = []
-        for log_entry in _LOG_BATCH:
-            row = [str(log_entry.get(h, "")) if log_entry.get(h, "") is not None else "" for h in headers]
-            rows.append(row)
-        # Записываем все строки одним запросом
-        if rows:
-            w.append_rows(rows, value_input_option="USER_ENTERED")
-        _LOG_BATCH = []
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO delivery_log (ts, client_id, event_id, action, details)
+                   VALUES ($1, $2, $3, $4, $5)""",
+                now_kyiv(), client_id, event_id, action, details
+            )
     except Exception as e:
-        # В случае ошибки сохраняем логи в файл для отладки
-        import json
-        with open("/tmp/failed_logs.json", "a") as f:
-            json.dump(_LOG_BATCH, f)
-            f.write("\n")
-        _LOG_BATCH = []
+        print(f"Error logging action: {e}")
 
-def has_log(action: str, client_id: str, event_id: str, log_rows: Optional[List[Dict[str, Any]]] = None) -> bool:
-    """Проверяет, есть ли запись в логе с заданными параметрами.
-    log_rows - опциональный список записей лога для оптимизации."""
+async def has_log(action: str, client_id: int, event_id: int) -> bool:
+    """Проверка наличия записи в логе"""
     try:
-        if log_rows is None:
-            w = ws(SHEET_LOG)
-            log_rows = get_all_records(w)
-        for r in log_rows:
-            if str(r.get("action")) == action and str(r.get("client_id")) == client_id and str(r.get("event_id")) == event_id:
-                return True
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT 1 FROM delivery_log
+                   WHERE action = $1 AND client_id = $2 AND event_id = $3
+                   LIMIT 1""",
+                action, client_id, event_id
+            )
+            return row is not None
     except Exception:
         return False
-    return False
 
-def get_eventtypes_active() -> List[Dict[str, Any]]:
-    w = ws(SHEET_EVENTTYPES)
-    rows = get_all_records(w)
-    return [r for r in rows if a2i(r.get("active"), 0) == 1]
+async def get_eventtypes_active() -> List[Dict[str, Any]]:
+    """Получение активных типов событий"""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM event_types WHERE active = TRUE"
+        )
+        return [dict(row) for row in rows]
 
-def get_eventtype_by_code(type_code: int) -> Optional[Dict[str, Any]]:
-    for r in get_eventtypes_active():
-        if a2i(r.get("type_code"), -1) == int(type_code):
-            return r
-    return None
+async def get_eventtype_by_code(type_code: int) -> Optional[Dict[str, Any]]:
+    """Получение типа события по коду"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM event_types WHERE type_code = $1 AND active = TRUE",
+            type_code
+        )
+        return dict(row) if row else None
 
 def client_id_for_tg(tg_user_id: int) -> str:
+    """Генерация client_id (для обратной совместимости, теперь используем INT)"""
     return f"cl_{tg_user_id}"
 
-def get_client_by_tg(tg_user_id: int) -> Optional[Dict[str, Any]]:
-    w = ws(SHEET_CLIENTS)
-    rows = get_all_records(w)
-    for r in rows:
-        if str(r.get("tg_user_id")).strip() == str(tg_user_id):
-            return r
-    return None
+async def get_client_by_tg(tg_user_id: int) -> Optional[Dict[str, Any]]:
+    """Получение клиента по Telegram ID"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM clients WHERE tg_user_id = $1",
+            tg_user_id
+        )
+        return dict(row) if row else None
 
-def upsert_client(tg_user_id: int, full_name: str, phone: str, status: str = "active") -> Dict[str, Any]:
-    w = ws(SHEET_CLIENTS)
-    cid = client_id_for_tg(tg_user_id)
-    now = iso_dt()
-    payload = {
-        "client_id": cid,
-        "tg_user_id": tg_user_id,
-        "phone": phone,
-        "full_name": full_name,
-        "status": status,
-        "created_at": now,
-        "last_seen_at": now,
-    }
-    existing_row = find_row_by_value(w, "tg_user_id", tg_user_id)
-    if existing_row:
-        old_vals = w.row_values(existing_row)
-        headers = ws_headers(w)
-        old_map = {headers[i]: old_vals[i] if i < len(old_vals) else "" for i in range(len(headers))}
-        payload["created_at"] = old_map.get("created_at", now)
-        update_row_dict(w, existing_row, payload)
-    else:
-        append_dict(w, payload)
-    log_action("client_registered", client_id=cid, event_id=None, details=f"tg={tg_user_id}")
-    return payload
+async def upsert_client(tg_user_id: int, full_name: str, phone: str, status: str = "active") -> Dict[str, Any]:
+    """Создание или обновление клиента"""
+    now = now_kyiv()
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO clients (tg_user_id, phone, full_name, status, created_at, last_seen_at)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (tg_user_id)
+               DO UPDATE SET
+                   phone = EXCLUDED.phone,
+                   full_name = EXCLUDED.full_name,
+                   status = EXCLUDED.status,
+                   last_seen_at = EXCLUDED.last_seen_at
+               RETURNING *""",
+            tg_user_id, phone, full_name, status, now, now
+        )
+        client = dict(row)
+        await log_action("client_registered", client_id=client['client_id'], details=f"tg={tg_user_id}")
+        return client
 
-def touch_client_seen(tg_user_id: int) -> None:
-    w = ws(SHEET_CLIENTS)
-    row = find_row_by_value(w, "tg_user_id", tg_user_id)
-    if row:
-        update_cell(w, row, "last_seen_at", iso_dt())
+async def touch_client_seen(tg_user_id: int) -> None:
+    """Обновление времени последнего визита"""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE clients SET last_seen_at = $1 WHERE tg_user_id = $2",
+            now_kyiv(), tg_user_id
+        )
 
-def list_active_clients() -> List[Dict[str, Any]]:
-    cache_key = _cache_key(SHEET_CLIENTS, "active")
-    cached = _get_cached(cache_key)
-    if cached is not None:
-        return cached
-    w = ws(SHEET_CLIENTS)
-    rows = get_all_records(w)
-    result = [r for r in rows if str(r.get("status", "")).strip().lower() == "active"]
-    _set_cache(cache_key, result)
-    return result
+async def list_active_clients() -> List[Dict[str, Any]]:
+    """Получение списка активных клиентов"""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM clients WHERE status = 'active'"
+        )
+        return [dict(row) for row in rows]
 
-def create_event(type_code: int, title: str, description: str, start_at: str,
-                 duration_min: int, link: str, created_by: str) -> Dict[str, Any]:
-    w = ws(SHEET_EVENTS)
-    event_id = f"ev_{short_uuid(10)}"
-    payload = {
-        "event_id": event_id,
-        "type": int(type_code),
-        "title": title,
-        "description": description,
-        "start_at": start_at,
-        "duration_min": int(duration_min),
-        "link": link,
-        "created_by": created_by,
-        "created_at": iso_dt(),
-    }
-    append_dict(w, payload)
-    _invalidate_cache(SHEET_EVENTS)
-    log_action("event_created", client_id=None, event_id=event_id, details=f"type={type_code}")
-    return payload
+async def create_event(type_code: int, title: str, description: str, start_at: str,
+                 duration_min: int, link: str, created_by: int) -> Dict[str, Any]:
+    """Создание события"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO events (type, title, description, start_at, duration_min, link, created_by, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               RETURNING *""",
+            type_code, title, description, parse_dt(start_at), duration_min, link, created_by, now_kyiv()
+        )
+        event = dict(row)
+        event['start_at'] = iso_dt(event['start_at']) if event.get('start_at') else ""
+        await log_action("event_created", event_id=event['event_id'], details=f"type={type_code}")
+        return event
 
-def get_all_events() -> List[Dict[str, Any]]:
-    cache_key = _cache_key(SHEET_EVENTS, "all")
-    cached = _get_cached(cache_key)
-    if cached is not None:
-        return cached
-    w = ws(SHEET_EVENTS)
-    result = get_all_records(w)
-    _set_cache(cache_key, result)
-    return result
+async def get_all_events() -> List[Dict[str, Any]]:
+    """Получение всех событий"""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM events ORDER BY start_at")
+        result = []
+        for row in rows:
+            event = dict(row)
+            event['start_at'] = iso_dt(event['start_at']) if event.get('start_at') else ""
+            result.append(event)
+        return result
 
-def get_event_by_id(event_id: str) -> Optional[Dict[str, Any]]:
-    for r in get_all_events():
-        if str(r.get("event_id")).strip() == event_id:
-            return r
-    return None
+async def get_event_by_id(event_id: int) -> Optional[Dict[str, Any]]:
+    """Получение события по ID"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM events WHERE event_id = $1",
+            event_id
+        )
+        if row:
+            event = dict(row)
+            event['start_at'] = iso_dt(event['start_at']) if event.get('start_at') else ""
+            return event
+        return None
 
-def update_event_field(event_id: str, field: str, value: Any) -> None:
-    w = ws(SHEET_EVENTS)
-    row = find_row_by_value(w, "event_id", event_id)
-    if row:
-        update_cell(w, row, field, value)
-        log_action("event_updated", client_id=None, event_id=event_id, details=f"{field}={value}")
+async def update_event_field(event_id: int, field: str, value: Any) -> None:
+    """Обновление поля события"""
+    # Защита от SQL injection - используем белый список полей
+    allowed_fields = {'title', 'description', 'start_at', 'duration_min', 'link'}
+    if field not in allowed_fields:
+        return
 
-def delete_event(event_id: str) -> None:
-    w = ws(SHEET_EVENTS)
-    row = find_row_by_value(w, "event_id", event_id)
-    if row:
-        delete_row(w, row)
-        log_action("event_canceled", client_id=None, event_id=event_id, details="deleted")
+    async with db_pool.acquire() as conn:
+        if field == 'start_at':
+            value = parse_dt(value) if isinstance(value, str) else value
+
+        query = f"UPDATE events SET {field} = $1 WHERE event_id = $2"
+        await conn.execute(query, value, event_id)
+        await log_action("event_updated", event_id=event_id, details=f"{field}={value}")
+
+async def delete_event(event_id: int) -> None:
+    """Удаление события"""
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM events WHERE event_id = $1", event_id)
+        await log_action("event_canceled", event_id=event_id, details="deleted")
 
 def event_start_dt(event: Dict[str, Any]) -> Optional[datetime]:
-    return parse_dt(str(event.get("start_at", "")).strip())
-
-def list_future_events_sorted() -> List[Dict[str, Any]]:
-    now = now_kyiv()
-    events = []
-    for e in get_all_events():
-        dt = event_start_dt(e)
-        if dt and dt >= now - timedelta(days=1):
-            events.append((dt, e))
-    events.sort(key=lambda x: x[0])
-    return [e for _, e in events]
-
-def list_alternative_events_same_type(type_code: int, exclude_event_id: str) -> List[Dict[str, Any]]:
-    out = []
-    now = now_kyiv()
-    for e in get_all_events():
-        if a2i(e.get("type")) == int(type_code) and str(e.get("event_id")) != exclude_event_id:
-            dt = event_start_dt(e)
-            if dt and dt >= now:
-                out.append((dt, e))
-    out.sort(key=lambda x: x[0])
-    return [e for _, e in out]
-
-def mark_attendance(event_id: str, client_id: str, attended: int = 1) -> None:
-    w = ws(SHEET_ATTEND)
-    rows = get_all_records(w)
-    row = None
-    for i, r in enumerate(rows, start=2):
-        if str(r.get("event_id")) == event_id and str(r.get("client_id")) == client_id:
-            row = i
-            break
-    payload = {
-        "event_id": event_id,
-        "client_id": client_id,
-        "attended": int(attended),
-        "marked_at": iso_dt(),
-    }
-    if row:
-        update_row_dict(w, row, payload)
-    else:
-        append_dict(w, payload)
-    log_action("attendance_marked", client_id=client_id, event_id=event_id, details=f"attended={attended}")
-
-def attendance_clear_for_event(event_id: str, mode: str = "zero") -> int:
-    """
-    mode="zero"  — проставить attended=0 всем по этому event_id (и обновить marked_at)
-    mode="delete" — удалить строки Attendance для этого event_id
-    Возвращает количество затронутых строк.
-    """
-    w = ws(SHEET_ATTEND)
-    rows = get_all_records(w)
-    touched = 0
-
-    if mode == "delete":
-        # соберём индексы и удалим снизу, чтобы не сдвигались
-        idxs = [i for i, r in enumerate(rows, start=2) if str(r.get("event_id")) == event_id]
-        for i in reversed(idxs):
-            delete_row(w, i)
-            touched += 1
-    else:
-        # zero: ставим attended=0
-        for i, r in enumerate(rows, start=2):
-            if str(r.get("event_id")) == event_id:
-                update_cell(w, i, "attended", 0)
-                update_cell(w, i, "marked_at", iso_dt())
-                touched += 1
-
-    log_action("attendance_cleared_on_cancel", client_id="", event_id=event_id, details=f"mode={mode}; rows={touched}")
-    return touched
-
-
-def client_has_attended_type(client_id: str, type_code: int, events_by_id: Optional[Dict[str, Dict[str, Any]]] = None, attendance_rows: Optional[List[Dict[str, Any]]] = None) -> bool:
-    """Проверяет, посещал ли клиент конференцию данного типа.
-    events_by_id - опциональный словарь {event_id: event} для оптимизации.
-    attendance_rows - опциональный список записей Attendance для оптимизации."""
-    if events_by_id is None:
-        events_by_id = {e.get("event_id"): e for e in get_all_events()}
-    if attendance_rows is None:
-        w = ws(SHEET_ATTEND)
-        attendance_rows = get_all_records(w)
-    for r in attendance_rows:
-        if str(r.get("client_id")) == client_id and a2i(r.get("attended")) == 1:
-            ev = events_by_id.get(str(r.get("event_id")))
-            if ev and a2i(ev.get("type")) == int(type_code):
-                return True
-    return False
-
-def rsvp_upsert(event_id: str, client_id: str, rsvp: Optional[str] = None,
-                remind_24h: Optional[int] = None,
-                reminded_24h: Optional[int] = None,
-                reminded_60m: Optional[int] = None) -> None:
-    w = ws(SHEET_RSVP)
-    rows = get_all_records(w)
-    row_idx = None
-    base = {}
-    for i, r in enumerate(rows, start=2):
-        if str(r.get("event_id")) == event_id and str(r.get("client_id")) == client_id:
-            row_idx = i
-            base = r
-            break
-    payload = {
-        "event_id": event_id,
-        "client_id": client_id,
-        "rsvp": rsvp if rsvp is not None else base.get("rsvp", ""),
-        "remind_24h": int(remind_24h) if remind_24h is not None else a2i(base.get("remind_24h"), 0),
-        "reminded_24h": int(reminded_24h) if reminded_24h is not None else a2i(base.get("reminded_24h"), 0),
-        "reminded_60m": int(reminded_60m) if reminded_60m is not None else a2i(base.get("reminded_60m"), 0),
-        "rsvp_at": iso_dt(),
-    }
-    if row_idx:
-        update_row_dict(w, row_idx, payload)
-    else:
-        append_dict(w, payload)
-
-def rsvp_get_for_event(event_id: str) -> List[Dict[str, Any]]:
-    w = ws(SHEET_RSVP)
-    return [r for r in get_all_records(w) if str(r.get("event_id")) == event_id]
-
-def feedback_get(event_id: str, client_id: str) -> Optional[Dict[str, Any]]:
-    w = ws(SHEET_FEEDBACK)
-    rows = get_all_records(w)
-    for r in rows:
-        if str(r.get("event_id")) == event_id and str(r.get("client_id")) == client_id:
-            return r
+    """Получение datetime начала события"""
+    start_at = event.get("start_at")
+    if isinstance(start_at, datetime):
+        return start_at.replace(tzinfo=TZ) if start_at.tzinfo is None else start_at
+    if isinstance(start_at, str):
+        return parse_dt(start_at)
     return None
 
+async def list_future_events_sorted() -> List[Dict[str, Any]]:
+    """Получение будущих событий, отсортированных по дате"""
+    now = now_kyiv()
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM events WHERE start_at >= $1 - INTERVAL '1 day' ORDER BY start_at",
+            now
+        )
+        result = []
+        for row in rows:
+            event = dict(row)
+            event['start_at'] = iso_dt(event['start_at']) if event.get('start_at') else ""
+            result.append(event)
+        return result
 
-def feedback_upsert(event_id: str, client_id: str, stars: Optional[int] = None, comment: Optional[str] = None) -> Dict[str, Any]:
-    """Создаёт или обновляет запись фидбэка для пары (event_id, client_id)."""
-    w = ws(SHEET_FEEDBACK)
-    rows = get_all_records(w)
-    row_idx = None
-    current = {}
-    for i, r in enumerate(rows, start=2):
-        if str(r.get("event_id")) == event_id and str(r.get("client_id")) == client_id:
-            row_idx = i
-            current = r
-            break
+async def list_alternative_events_same_type(type_code: int, exclude_event_id: int) -> List[Dict[str, Any]]:
+    """Получение альтернативных событий того же типа"""
+    now = now_kyiv()
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT * FROM events
+               WHERE type = $1 AND event_id != $2 AND start_at >= $3
+               ORDER BY start_at""",
+            type_code, exclude_event_id, now
+        )
+        result = []
+        for row in rows:
+            event = dict(row)
+            event['start_at'] = iso_dt(event['start_at']) if event.get('start_at') else ""
+            result.append(event)
+        return result
 
-    payload = {
-        "event_id": event_id,
-        "client_id": client_id,
-        "stars": int(stars) if stars is not None else a2i(current.get("stars"), 0),
-        "comment": (comment if comment is not None else current.get("comment", "")) or "",
-        "owner": current.get("owner", ""),
-    }
+async def mark_attendance(event_id: int, client_id: int, attended: bool = True) -> None:
+    """Отметка посещения"""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO attendance (event_id, client_id, attended, marked_at)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (event_id, client_id)
+               DO UPDATE SET attended = EXCLUDED.attended, marked_at = EXCLUDED.marked_at""",
+            event_id, client_id, attended, now_kyiv()
+        )
+        await log_action("attendance_marked", client_id=client_id, event_id=event_id, details=f"attended={attended}")
 
-    if row_idx:
-        update_row_dict(w, row_idx, payload)
-    else:
-        append_dict(w, payload)
+async def attendance_clear_for_event(event_id: int, mode: str = "zero") -> int:
+    """Очистка записей о посещении для события"""
+    async with db_pool.acquire() as conn:
+        if mode == "delete":
+            result = await conn.execute("DELETE FROM attendance WHERE event_id = $1", event_id)
+        else:
+            result = await conn.execute(
+                "UPDATE attendance SET attended = FALSE, marked_at = $1 WHERE event_id = $2",
+                now_kyiv(), event_id
+            )
 
-    return payload
+        touched = int(result.split()[-1]) if result else 0
+        await log_action("attendance_cleared_on_cancel", event_id=event_id, details=f"mode={mode}; rows={touched}")
+        return touched
 
+async def client_has_attended_type(client_id: int, type_code: int) -> bool:
+    """Проверка, посещал ли клиент событие данного типа"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT 1 FROM attendance a
+               JOIN events e ON a.event_id = e.event_id
+               WHERE a.client_id = $1 AND e.type = $2 AND a.attended = TRUE
+               LIMIT 1""",
+            client_id, type_code
+        )
+        return row is not None
 
-def feedback_assign_owner(event_id: str, client_id: str, owner: str) -> None:
-    w = ws(SHEET_FEEDBACK)
-    rows = get_all_records(w)
-    last_idx = None
-    for i, r in enumerate(rows, start=2):
-        if str(r.get("event_id")) == event_id and str(r.get("client_id")) == client_id:
-            last_idx = i
-    if last_idx:
-        update_cell(w, last_idx, "owner", owner)
+async def rsvp_upsert(event_id: int, client_id: int, rsvp: Optional[str] = None,
+                remind_24h: Optional[bool] = None,
+                reminded_24h: Optional[bool] = None,
+                reminded_60m: Optional[bool] = None) -> None:
+    """Создание или обновление RSVP"""
+    async with db_pool.acquire() as conn:
+        # Сначала получаем текущие значения, если запись существует
+        current = await conn.fetchrow(
+            "SELECT * FROM rsvp WHERE event_id = $1 AND client_id = $2",
+            event_id, client_id
+        )
 
-def try_get_tg_from_client_id(client_id: str) -> Optional[int]:
-    w = ws(SHEET_CLIENTS)
-    rows = get_all_records(w)
-    for r in rows:
-        if str(r.get("client_id")) == str(client_id):
-            return int(r.get("tg_user_id"))
-    return None
+        # Используем текущие значения, если новые не предоставлены
+        if current:
+            rsvp_val = rsvp if rsvp is not None else current['rsvp']
+            remind_24h_val = remind_24h if remind_24h is not None else current['remind_24h']
+            reminded_24h_val = reminded_24h if reminded_24h is not None else current['reminded_24h']
+            reminded_60m_val = reminded_60m if reminded_60m is not None else current['reminded_60m']
+        else:
+            rsvp_val = rsvp or ""
+            remind_24h_val = remind_24h or False
+            reminded_24h_val = reminded_24h or False
+            reminded_60m_val = reminded_60m or False
 
-def get_event_statistics(event_id: str) -> Dict[str, Any]:
-    """Возвращает статистику по событию:
-    - invitations_sent: количество отправленных приглашений (из DeliveryLog)
-    - confirmed_count: количество подтвержденных участников (RSVP с rsvp='going')
-    - confirmed_clients: список клиентов, которые подтвердили участие (имя и телефон)
-    """
-    # Считаем приглашения из DeliveryLog
-    w_log = ws(SHEET_LOG)
-    log_rows = get_all_records(w_log)
-    invitations_sent = sum(1 for r in log_rows if str(r.get("action")) == "invite_sent" and str(r.get("event_id")) == event_id)
+        await conn.execute(
+            """INSERT INTO rsvp (event_id, client_id, rsvp, remind_24h, reminded_24h, reminded_60m, rsvp_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (event_id, client_id)
+               DO UPDATE SET
+                   rsvp = EXCLUDED.rsvp,
+                   remind_24h = EXCLUDED.remind_24h,
+                   reminded_24h = EXCLUDED.reminded_24h,
+                   reminded_60m = EXCLUDED.reminded_60m,
+                   rsvp_at = EXCLUDED.rsvp_at""",
+            event_id, client_id, rsvp_val, remind_24h_val, reminded_24h_val, reminded_60m_val, now_kyiv()
+        )
 
-    # Считаем подтверждения из RSVP и собираем список client_id
-    w_rsvp = ws(SHEET_RSVP)
-    rsvp_rows = get_all_records(w_rsvp)
-    confirmed_client_ids = [str(r.get("client_id")) for r in rsvp_rows if str(r.get("event_id")) == event_id and str(r.get("rsvp")) == "going"]
+async def rsvp_get_for_event(event_id: int) -> List[Dict[str, Any]]:
+    """Получение RSVP для события"""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM rsvp WHERE event_id = $1",
+            event_id
+        )
+        return [dict(row) for row in rows]
 
-    # Получаем данные клиентов
-    w_clients = ws(SHEET_CLIENTS)
-    client_rows = get_all_records(w_clients)
+async def rsvp_get_for_client(client_id: int) -> List[Dict[str, Any]]:
+    """Получение RSVP для клиента"""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM rsvp WHERE client_id = $1",
+            client_id
+        )
+        return [dict(row) for row in rows]
 
-    # Формируем список подтвердивших клиентов с их данными
-    confirmed_clients = []
-    for cid in confirmed_client_ids:
-        for cli in client_rows:
-            if str(cli.get("client_id")) == cid:
-                confirmed_clients.append({
-                    "client_id": cid,
-                    "full_name": cli.get("full_name", "—"),
-                    "phone": cli.get("phone", "—")
-                })
-                break
+async def client_has_active_invite_for_type(client_id: int, type_code: int) -> bool:
+    """Проверка наличия активного приглашения для типа события"""
+    now = now_kyiv()
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT 1 FROM rsvp r
+               JOIN events e ON r.event_id = e.event_id
+               WHERE r.client_id = $1
+                 AND e.type = $2
+                 AND e.start_at >= $3
+                 AND (r.rsvp = '' OR r.rsvp = 'going')
+               LIMIT 1""",
+            client_id, type_code, now
+        )
+        return row is not None
 
-    return {
-        "invitations_sent": invitations_sent,
-        "confirmed_count": len(confirmed_client_ids),
-        "confirmed_clients": confirmed_clients
-    }
+async def is_earliest_upcoming_event_of_type(event: Dict[str, Any]) -> bool:
+    """Проверка, является ли событие самым ранним предстоящим событием данного типа"""
+    now = now_kyiv()
+    event_type = event.get('type')
+    dt_this = event_start_dt(event)
+
+    if not dt_this:
+        return False
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT event_id FROM events
+               WHERE type = $1 AND start_at >= $2
+               ORDER BY start_at
+               LIMIT 1""",
+            event_type, now
+        )
+        return row and row['event_id'] == event.get('event_id')
+
+async def feedback_get(event_id: int, client_id: int) -> Optional[Dict[str, Any]]:
+    """Получение отзыва"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM feedback WHERE event_id = $1 AND client_id = $2",
+            event_id, client_id
+        )
+        return dict(row) if row else None
+
+async def feedback_upsert(event_id: int, client_id: int, stars: Optional[int] = None, comment: Optional[str] = None) -> Dict[str, Any]:
+    """Создание или обновление отзыва"""
+    async with db_pool.acquire() as conn:
+        current = await conn.fetchrow(
+            "SELECT * FROM feedback WHERE event_id = $1 AND client_id = $2",
+            event_id, client_id
+        )
+
+        if current:
+            stars_val = stars if stars is not None else current['stars']
+            comment_val = comment if comment is not None else current['comment']
+            owner_val = current['owner']
+        else:
+            stars_val = stars or 0
+            comment_val = comment or ""
+            owner_val = ""
+
+        row = await conn.fetchrow(
+            """INSERT INTO feedback (event_id, client_id, stars, comment, owner, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (event_id, client_id)
+               DO UPDATE SET
+                   stars = EXCLUDED.stars,
+                   comment = EXCLUDED.comment
+               RETURNING *""",
+            event_id, client_id, stars_val, comment_val, owner_val, now_kyiv()
+        )
+        return dict(row)
+
+async def feedback_assign_owner(event_id: int, client_id: int, owner: str) -> None:
+    """Назначение ответственного за отзыв"""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE feedback SET owner = $1 WHERE event_id = $2 AND client_id = $3",
+            owner, event_id, client_id
+        )
+
+async def try_get_tg_from_client_id(client_id: int) -> Optional[int]:
+    """Получение Telegram ID по client_id"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT tg_user_id FROM clients WHERE client_id = $1",
+            client_id
+        )
+        return row['tg_user_id'] if row else None
+
+async def get_event_statistics(event_id: int) -> Dict[str, Any]:
+    """Получение статистики по событию"""
+    async with db_pool.acquire() as conn:
+        # Количество отправленных приглашений
+        invitations_sent = await conn.fetchval(
+            "SELECT COUNT(*) FROM delivery_log WHERE action = 'invite_sent' AND event_id = $1",
+            event_id
+        )
+
+        # Подтвержденные участники
+        confirmed = await conn.fetch(
+            """SELECT c.client_id, c.full_name, c.phone
+               FROM rsvp r
+               JOIN clients c ON r.client_id = c.client_id
+               WHERE r.event_id = $1 AND r.rsvp = 'going'""",
+            event_id
+        )
+
+        confirmed_clients = [
+            {
+                "client_id": row['client_id'],
+                "full_name": row['full_name'] or "—",
+                "phone": row['phone'] or "—"
+            }
+            for row in confirmed
+        ]
+
+        return {
+            "invitations_sent": invitations_sent or 0,
+            "confirmed_count": len(confirmed_clients),
+            "confirmed_clients": confirmed_clients
+        }
+
+async def build_types_overview_text(cli: Dict[str, Any]) -> str:
+    """Построение обзорного текста по типам событий"""
+    text = (
+        "✅ Ви підключені до розсилки на конференції.\n"
+        "Надсилатимемо інвайти на найближчі події.\n\n"
+        "Доступні типи конференцій:\n"
+    )
+    rows = await get_eventtypes_active()
+    if not rows:
+        return text + "Наразі немає активних типів."
+
+    lines = []
+    for rt in rows:
+        tcode = rt.get("type_code")
+        title = str(rt.get("title"))
+        attended = await client_has_attended_type(cli['client_id'], tcode)
+        flag = "✅ Був(ла)" if attended else "⭕️ Ще не був(ла)"
+        lines.append(f"• {title} — {flag}")
+
+    return text + "\n".join(lines)
 
 # ============================== KEYBOARDS ======================================
 
@@ -685,7 +578,7 @@ def kb_admin_main() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📋 Список конференцій", callback_data="admin:list:0")],
     ])
 
-def kb_rsvp(event_id: str) -> InlineKeyboardMarkup:
+def kb_rsvp(event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Так, буду", callback_data=f"rsvp:{event_id}:going"),
@@ -693,8 +586,7 @@ def kb_rsvp(event_id: str) -> InlineKeyboardMarkup:
         ]
     ])
 
-
-def kb_event_actions(event_id: str) -> InlineKeyboardMarkup:
+def kb_event_actions(event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="ℹ️ Інфо", callback_data=f"admin:info:{event_id}")],
         [InlineKeyboardButton(text="✏️ Змінити", callback_data=f"admin:edit:{event_id}")],
@@ -702,7 +594,7 @@ def kb_event_actions(event_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:list:0")],
     ])
 
-def kb_edit_event_menu(event_id: str) -> InlineKeyboardMarkup:
+def kb_edit_event_menu(event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Назва", callback_data=f"admin:edit:{event_id}:field:title")],
         [InlineKeyboardButton(text="✏️ Опис", callback_data=f"admin:edit:{event_id}:field:description")],
@@ -712,27 +604,29 @@ def kb_edit_event_menu(event_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:list:0")],
     ])
 
-def kb_cancel_confirm(event_id: str) -> InlineKeyboardMarkup:
+def kb_cancel_confirm(event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Так, скасувати", callback_data=f"admin:cancel:{event_id}:yes")],
         [InlineKeyboardButton(text="⬅️ Ні, назад", callback_data=f"admin:edit:{event_id}")],
     ])
 
-def kb_claim_feedback(event_id: str, client_id: str) -> InlineKeyboardMarkup:
+def kb_claim_feedback(event_id: int, client_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛠 Беру в роботу", callback_data=f"claim:{event_id}:{client_id}")],
     ])
 
-def kb_event_info(event_id: str) -> InlineKeyboardMarkup:
+def kb_event_info(event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Оновити", callback_data=f"admin:info:{event_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin:event:{event_id}")],
     ])
+
 def kb_client_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📋 Мої конференції")]],
         resize_keyboard=True
     )
+
 # ============================== STATE / MEMORY =================================
 
 ADMINS: set[int] = set()
@@ -765,7 +659,7 @@ scheduler = AsyncIOScheduler(timezone=str(TZ))
 
 @dp.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
-    touch_client_seen(m.from_user.id)
+    await touch_client_seen(m.from_user.id)
     args = (m.text or "").split(maxsplit=1)
     arg = ""
     if len(args) > 1:
@@ -783,7 +677,7 @@ async def cmd_start(m: Message, state: FSMContext):
             return
 
     # Клієнтський режим
-    cli = get_client_by_tg(m.from_user.id)
+    cli = await get_client_by_tg(m.from_user.id)
     if not cli or not cli.get("full_name") or not cli.get("phone"):
         await state.set_state(RegisterSG.wait_name)
         await m.answer("👋 Привіт! Вкажіть, будь ласка, Ваше ПІБ (українською).")
@@ -792,12 +686,13 @@ async def cmd_start(m: Message, state: FSMContext):
     await send_welcome_and_types_list(m, cli)
 
 async def send_welcome_and_types_list(m: Message, cli: Dict[str, Any]):
-    await m.answer(build_types_overview_text(cli), reply_markup=kb_client_main())
-
+    text = await build_types_overview_text(cli)
+    await m.answer(text, reply_markup=kb_client_main())
 
 @dp.message(Command("help"))
 async def cmd_help(m: Message):
-    await m.answer(messages_get("help.body"))
+    text = await messages_get("help.body")
+    await m.answer(text)
 
 # ---------- Реєстрація клієнта ----------
 
@@ -818,17 +713,18 @@ async def reg_wait_phone(m: Message, state: FSMContext):
         await m.answer("Невірний формат. Приклад: 380671234567. Спробуйте ще раз:")
         return
     data = await state.get_data()
-    cli = upsert_client(m.from_user.id, data["full_name"], phone)
+    cli = await upsert_client(m.from_user.id, data["full_name"], phone)
     await state.clear()
     await send_welcome_and_types_list(m, cli)
-    
+
 @dp.message(F.text == "📋 Мої конференції")
 async def show_my_conferences(m: Message):
-    cli = get_client_by_tg(m.from_user.id)
+    cli = await get_client_by_tg(m.from_user.id)
     if not cli:
         await m.answer("Будь ласка, зареєструйтесь командою /start.", reply_markup=kb_client_main())
         return
-    await m.answer(build_types_overview_text(cli), reply_markup=kb_client_main())
+    text = await build_types_overview_text(cli)
+    await m.answer(text, reply_markup=kb_client_main())
 
 # ---------- Адмін меню / додати / список / редагування ----------
 
@@ -837,7 +733,7 @@ async def admin_add(q: CallbackQuery, state: FSMContext):
     if q.from_user.id not in ADMINS:
         await q.answer()
         return
-    types = get_eventtypes_active()
+    types = await get_eventtypes_active()
     if not types:
         await q.message.edit_text("Немає активних типів конференцій.", reply_markup=kb_admin_main())
         await q.answer()
@@ -853,7 +749,7 @@ async def admin_add_select_type(q: CallbackQuery, state: FSMContext):
         await q.answer()
         return
     type_code = int(q.data.split(":")[-1])
-    et = get_eventtype_by_code(type_code)
+    et = await get_eventtype_by_code(type_code)
     if not et:
         await q.message.edit_text("Тип не знайдено.", reply_markup=kb_admin_main())
         await q.answer()
@@ -956,14 +852,14 @@ async def admin_add_wait_duration(m: Message, state: FSMContext):
 async def admin_add_wait_link(m: Message, state: FSMContext):
     link = (m.text or "").strip()
     data = await state.get_data()
-    created = create_event(
+    created = await create_event(
         type_code=int(data["type_code"]),
         title=data["title"],
         description=data["description"],
         start_at=data["start_at"],
         duration_min=int(data["duration_min"]),
         link=link,
-        created_by=f"admin:{m.from_user.id}",
+        created_by=m.from_user.id,
     )
     await send_initial_invites_for_event(created)
     await state.clear()
@@ -990,7 +886,7 @@ async def admin_list(q: CallbackQuery):
         await q.answer()
         return
     page = int(q.data.split(":")[-1])
-    events = list_future_events_sorted()
+    events = await list_future_events_sorted()
     per = 10
     total = len(events)
     start = page * per
@@ -1025,8 +921,8 @@ async def admin_event_open(q: CallbackQuery):
     if len(parts) != 3:
         await q.answer()
         return
-    event_id = parts[-1]
-    e = get_event_by_id(event_id)
+    event_id = int(parts[-1])
+    e = await get_event_by_id(event_id)
     if not e:
         await q.message.edit_text("Подію не знайдено.", reply_markup=kb_admin_main())
         await q.answer()
@@ -1047,17 +943,15 @@ async def admin_info(q: CallbackQuery):
     if len(parts) != 3:
         await q.answer()
         return
-    event_id = parts[-1]
-    e = get_event_by_id(event_id)
+    event_id = int(parts[-1])
+    e = await get_event_by_id(event_id)
     if not e:
         await q.message.edit_text("Подію не знайдено.", reply_markup=kb_admin_main())
         await q.answer()
         return
 
-    # Получаем статистику
-    stats = get_event_statistics(event_id)
+    stats = await get_event_statistics(event_id)
 
-    # Форматируем сообщение
     text = (
         f"ℹ️ Статистика події\n\n"
         f"📌 Подія: {e['title']}\n"
@@ -1067,7 +961,6 @@ async def admin_info(q: CallbackQuery):
         f"• Підтвердили участь: {stats['confirmed_count']}\n"
     )
 
-    # Добавляем список подтвердивших клиентов
     if stats['confirmed_clients']:
         text += f"\n✅ Підтвердили участь:\n"
         for i, cli in enumerate(stats['confirmed_clients'], 1):
@@ -1085,12 +978,12 @@ async def admin_edit(q: CallbackQuery, state: FSMContext):
         return
     parts = q.data.split(":")
     if len(parts) == 3:
-        event_id = parts[-1]
+        event_id = int(parts[-1])
         await q.message.edit_text("Оберіть поле для редагування:", reply_markup=kb_edit_event_menu(event_id))
         await q.answer()
         return
     if len(parts) == 5 and parts[3] == "field":
-        event_id = parts[2]
+        event_id = int(parts[2])
         field = parts[4]
         await state.set_state(AdminEditFieldSG.wait_value)
         await state.update_data(event_id=event_id, field=field)
@@ -1105,20 +998,17 @@ async def admin_edit(q: CallbackQuery, state: FSMContext):
         await q.answer()
 
 @dp.message(AdminEditFieldSG.wait_value)
-@dp.message(AdminEditFieldSG.wait_value)
 async def admin_edit_field_value(m: Message, state: FSMContext):
     data = await state.get_data()
     event_id = data.get("event_id")
     field = data.get("field")
 
-    # text-поля
     if field in {"title", "description", "link"}:
         val = (m.text or "").strip()
-        update_event_field(event_id, field, val)
+        await update_event_field(event_id, field, val)
         await m.answer("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
         await state.clear()
 
-        # подробные уведомления по каждому полю
         if field == "title":
             await notify_event_update(event_id, f"Оновлено назву: {val}")
         elif field == "description":
@@ -1127,20 +1017,17 @@ async def admin_edit_field_value(m: Message, state: FSMContext):
             await notify_event_update(event_id, f"Оновлено посилання: {val}")
         return
 
-    # дата/час
     if field == "start_at":
         dt = parse_dt(m.text or "")
         if not dt:
             await m.answer("Невірний формат. Приклад: 2025-10-05 15:00. Спробуйте ще раз:")
             return
-        update_event_field(event_id, "start_at", iso_dt(dt))
+        await update_event_field(event_id, "start_at", iso_dt(dt))
         await m.answer("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
         await state.clear()
-        # <-- ключ: в уведомлении шлём новое время
         await notify_event_update(event_id, f"Змінено дату/час: {fmt_date(dt)} о {fmt_time(dt)} (Київ)")
         return
 
-    # тривалість
     if field == "duration_min":
         try:
             dur = int((m.text or "").strip())
@@ -1149,12 +1036,11 @@ async def admin_edit_field_value(m: Message, state: FSMContext):
         except Exception:
             await m.answer("Введіть додатне ціле число. Спробуйте ще раз:")
             return
-        update_event_field(event_id, "duration_min", dur)
+        await update_event_field(event_id, "duration_min", dur)
         await m.answer("✅ Зміни збережено.", reply_markup=kb_edit_event_menu(event_id))
         await state.clear()
         await notify_event_update(event_id, f"Змінено тривалість: {dur} хв")
         return
-
 
 @dp.callback_query(F.data.startswith("admin:cancel:"))
 async def admin_cancel(q: CallbackQuery):
@@ -1163,22 +1049,18 @@ async def admin_cancel(q: CallbackQuery):
         return
     parts = q.data.split(":")
     if len(parts) == 3:
-        event_id = parts[-1]
+        event_id = int(parts[-1])
         await q.message.edit_text("Підтвердити скасування події?", reply_markup=kb_cancel_confirm(event_id))
         await q.answer()
         return
     if len(parts) == 4 and parts[-1] == "yes":
-        event_id = parts[2]
-        # 1) уведомляем участников
+        event_id = int(parts[2])
         await notify_event_cancel(event_id)
-        # 2) чистим Attendance (ставим attended=0) — можно mode="delete", если хочешь удалять строки полностью
-        attendance_clear_for_event(event_id, mode="zero")
-        # 3) удаляем сам ивент
-        delete_event(event_id)
+        await attendance_clear_for_event(event_id, mode="zero")
+        await delete_event(event_id)
         await q.message.edit_text("✅ Подію скасовано, відмітки відвідування скинуто.", reply_markup=kb_admin_main())
         await q.answer()
         return
-
 
 # ---------- RSVP ----------
 
@@ -1188,40 +1070,42 @@ async def cb_rsvp(q: CallbackQuery):
     if len(parts) != 3:
         await q.answer()
         return
-    _, event_id, action = parts
-    cli = get_client_by_tg(q.from_user.id)
+    _, event_id_str, action = parts
+    event_id = int(event_id_str)
+
+    cli = await get_client_by_tg(q.from_user.id)
     if not cli:
         await safe_edit_message(q.message, "Будь ласка, зареєструйтесь командою /start.")
         await q.answer()
         return
+
     client_id = cli["client_id"]
-    event = get_event_by_id(event_id)
+    event = await get_event_by_id(event_id)
     if not event:
         await safe_edit_message(q.message, "Подію не знайдено.")
         await q.answer()
         return
 
     if action == "going":
-        rsvp_upsert(event_id, client_id, rsvp="going")
-        mark_attendance(event_id, client_id, 1)
-        log_action("rsvp_yes", client_id=client_id, event_id=event_id, details="")
+        await rsvp_upsert(event_id, client_id, rsvp="going")
+        await mark_attendance(event_id, client_id, True)
+        await log_action("rsvp_yes", client_id=client_id, event_id=event_id, details="")
         await safe_edit_message(q.message, "Дякуємо! Участь підтверджено ✅")
         await q.answer()
         return
 
     if action == "declined":
-        rsvp_upsert(event_id, client_id, rsvp="declined")
-        log_action("rsvp_no", client_id=client_id, event_id=event_id, details="")
+        await rsvp_upsert(event_id, client_id, rsvp="declined")
+        await log_action("rsvp_no", client_id=client_id, event_id=event_id, details="")
 
-        alt = list_alternative_events_same_type(a2i(event.get("type")), event_id)
+        alt = await list_alternative_events_same_type(a2i(event.get("type")), event_id)
         if not alt:
             await safe_edit_message(q.message, "Добре! Тоді очікуйте нове запрошення на іншу дату.")
         else:
             rows = []
-            for a in alt[:8]:  # не больше 8 кнопок
+            for a in alt[:8]:
                 dt = event_start_dt(a)
                 when = f"{fmt_date(dt)} о {fmt_time(dt)}" if dt else a.get('start_at', '')
-                # Кнопка выбирает альтернативную дату
                 rows.append([InlineKeyboardButton(text=when, callback_data=f"alt:pick:{a['event_id']}")])
             rows.append([InlineKeyboardButton(text="❌ Закрити", callback_data="noop")])
 
@@ -1230,10 +1114,9 @@ async def cb_rsvp(q: CallbackQuery):
                 q.message,
                 f"Можливі альтернативні дати за темою «{title_for_info}»:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-        )
+            )
     await q.answer()
     return
-
 
 @dp.callback_query(F.data.startswith("claim:"))
 async def claim_feedback(q: CallbackQuery):
@@ -1241,39 +1124,40 @@ async def claim_feedback(q: CallbackQuery):
     if len(parts) != 3:
         await q.answer()
         return
-    _, event_id, client_id = parts
+    _, event_id_str, client_id_str = parts
+    event_id = int(event_id_str)
+    client_id = int(client_id_str)
+
     owner = f"@{q.from_user.username}" if q.from_user and q.from_user.username else f"id:{q.from_user.id}"
-    feedback_assign_owner(event_id, client_id, owner)
-    log_action("complaint_taken", client_id=client_id, event_id=event_id, details=f"owner={owner}")
+    await feedback_assign_owner(event_id, client_id, owner)
+    await log_action("complaint_taken", client_id=client_id, event_id=event_id, details=f"owner={owner}")
     await q.message.edit_text(f"✅ Взято в роботу ({owner})")
     await q.answer()
-    
+
 @dp.callback_query(F.data.startswith("alt:pick:"))
 async def alt_pick(q: CallbackQuery):
-    # alt:pick:<alt_event_id>
     parts = q.data.split(":")
     if len(parts) != 3:
         await q.answer()
         return
 
-    alt_event_id = parts[2]
-    cli = get_client_by_tg(q.from_user.id)
+    alt_event_id = int(parts[2])
+    cli = await get_client_by_tg(q.from_user.id)
     if not cli:
         await q.message.edit_text("Будь ласка, зареєструйтесь командою /start.")
         await q.answer()
         return
 
     client_id = cli["client_id"]
-    alt_event = get_event_by_id(alt_event_id)
+    alt_event = await get_event_by_id(alt_event_id)
     if not alt_event:
         await q.message.edit_text("Альтернативну дату не знайдено.")
         await q.answer()
         return
 
-    # подтверждаем участие на выбранной дате
-    rsvp_upsert(alt_event_id, client_id, rsvp="going")
-    mark_attendance(alt_event_id, client_id, 1)  # как и в обычном 'going' сейчас
-    log_action("rsvp_alt_yes", client_id=client_id, event_id=alt_event_id, details="picked_alternative")
+    await rsvp_upsert(alt_event_id, client_id, rsvp="going")
+    await mark_attendance(alt_event_id, client_id, True)
+    await log_action("rsvp_alt_yes", client_id=client_id, event_id=alt_event_id, details="picked_alternative")
 
     dt = event_start_dt(alt_event)
     when = f"{fmt_date(dt)} о {fmt_time(dt)}" if dt else alt_event.get("start_at", "")
@@ -1291,12 +1175,12 @@ async def noop(q: CallbackQuery):
 
 # ---------- FEEDBACK (зірки + коментар) ----------
 
-async def route_low_feedback(event_id: str, client_id: str, stars: int, comment: str):
-    cli_tg = try_get_tg_from_client_id(client_id)
-    cli_row = get_client_by_tg(cli_tg) if cli_tg else None
-    full_name = cli_row["full_name"] if cli_row else client_id
+async def route_low_feedback(event_id: int, client_id: int, stars: int, comment: str):
+    cli_tg = await try_get_tg_from_client_id(client_id)
+    cli_row = await get_client_by_tg(cli_tg) if cli_tg else None
+    full_name = cli_row["full_name"] if cli_row else str(client_id)
     phone = cli_row["phone"] if cli_row else "—"
-    event = get_event_by_id(event_id) or {}
+    event = await get_event_by_id(event_id) or {}
 
     text = (
         f"⚠️ Низька оцінка події\n"
@@ -1308,42 +1192,34 @@ async def route_low_feedback(event_id: str, client_id: str, stars: int, comment:
     )
     kb = kb_claim_feedback(event_id, client_id)
 
-    # 1) Пытаемся в SUPPORT_CHAT_ID
     try:
-        # Отключаем парсинг Markdown для сообщений с фидбеком
-        msg = await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text, reply_markup=kb, parse_mode=None)
-        log_action("feedback_low_notified", client_id=client_id, event_id=event_id, details=f"support_chat:{SUPPORT_CHAT_ID}")
+        await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text, reply_markup=kb, parse_mode=None)
+        await log_action("feedback_low_notified", client_id=client_id, event_id=event_id, details=f"support_chat:{SUPPORT_CHAT_ID}")
         return
     except TelegramRetryAfter as ex:
         await asyncio.sleep(ex.retry_after + 1)
         try:
-            msg = await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text, reply_markup=kb, parse_mode=None)
-            log_action("feedback_low_notified", client_id=client_id, event_id=event_id, details=f"support_chat:{SUPPORT_CHAT_ID}/after_retry")
+            await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text, reply_markup=kb, parse_mode=None)
+            await log_action("feedback_low_notified", client_id=client_id, event_id=event_id, details=f"support_chat:{SUPPORT_CHAT_ID}/after_retry")
             return
         except Exception as ex2:
-            log_action("feedback_low_notify_fail", client_id=client_id, event_id=event_id, details=f"retry_fail:{type(ex2).__name__}")
-
+            await log_action("feedback_low_notify_fail", client_id=client_id, event_id=event_id, details=f"retry_fail:{type(ex2).__name__}")
     except (TelegramForbiddenError, TelegramBadRequest) as ex:
-        # Бот не может писать в этот чат (не добавлен/не админ/неверный ID/канал закрыт и т.п.)
-        log_action("feedback_low_notify_fail", client_id=client_id, event_id=event_id, details=f"{type(ex).__name__}:{ex}")
-
+        await log_action("feedback_low_notify_fail", client_id=client_id, event_id=event_id, details=f"{type(ex).__name__}:{ex}")
     except Exception as ex:
-        log_action("feedback_low_notify_fail", client_id=client_id, event_id=event_id, details=f"unknown:{type(ex).__name__}")
+        await log_action("feedback_low_notify_fail", client_id=client_id, event_id=event_id, details=f"unknown:{type(ex).__name__}")
 
-    # 2) Фолбэк: личкой всем активным админам, если чат поддержки недоступен
     if ADMINS:
         for admin_id in list(ADMINS):
             try:
                 await bot.send_message(chat_id=admin_id, text="(фолбэк) " + text, reply_markup=kb, parse_mode=None)
-                log_action("feedback_low_notified_admin_dm", client_id=client_id, event_id=event_id, details=f"to_admin:{admin_id}")
+                await log_action("feedback_low_notified_admin_dm", client_id=client_id, event_id=event_id, details=f"to_admin:{admin_id}")
             except Exception as ex:
-                log_action("feedback_low_admin_dm_fail", client_id=client_id, event_id=event_id, details=f"{admin_id}:{type(ex).__name__}")
+                await log_action("feedback_low_admin_dm_fail", client_id=client_id, event_id=event_id, details=f"{admin_id}:{type(ex).__name__}")
 
-
-async def route_low_feedback_comment_update(event_id: str, client_id: str, comment: str):
-    # короткая "добавка" к уже отправленной скарге
-    cli_tg = try_get_tg_from_client_id(client_id)
-    event = get_event_by_id(event_id) or {}
+async def route_low_feedback_comment_update(event_id: int, client_id: int, comment: str):
+    cli_tg = await try_get_tg_from_client_id(client_id)
+    event = await get_event_by_id(event_id) or {}
     text = (
         f"📝 Доповнення до скарги\n"
         f"• Подія: {event.get('title','')}\n"
@@ -1351,12 +1227,10 @@ async def route_low_feedback_comment_update(event_id: str, client_id: str, comme
         f"• Коментар: {comment or '—'}"
     )
     try:
-        # Отключаем парсинг Markdown
         await bot.send_message(chat_id=SUPPORT_CHAT_ID, text=text, parse_mode=None)
-        log_action("low_fb_comment_update_sent", client_id=client_id, event_id=event_id, details="")
+        await log_action("low_fb_comment_update_sent", client_id=client_id, event_id=event_id, details="")
     except Exception as e:
-        log_action("support_send_error", client_id=client_id, event_id=event_id, details=f"{e!r}")
-
+        await log_action("support_send_error", client_id=client_id, event_id=event_id, details=f"{e!r}")
 
 @dp.callback_query(F.data.startswith("fb:"))
 async def fb_callbacks(q: CallbackQuery, state: FSMContext):
@@ -1364,22 +1238,21 @@ async def fb_callbacks(q: CallbackQuery, state: FSMContext):
 
     # Выбор звёзд: fb:<event_id>:<client_id>:<stars>
     if data.startswith("fb:") and data.count(":") == 3 and not data.startswith("fb:comment:") and not data.startswith("fb:skip:"):
-        _, event_id, client_id, stars = data.split(":")
-        stars = int(stars)
-    
-        # 1) сохраняем оценку
-        feedback_upsert(event_id, client_id, stars=stars)
-    
-        # 2) СРАЗУ пингуем саппорт, если <4
+        _, event_id_str, client_id_str, stars_str = data.split(":")
+        event_id = int(event_id_str)
+        client_id = int(client_id_str)
+        stars = int(stars_str)
+
+        await feedback_upsert(event_id, client_id, stars=stars)
+
         if stars < 4:
             try:
                 await route_low_feedback(event_id, client_id, stars, "")
-                log_action("low_fb_alert_sent", client_id=client_id, event_id=event_id, details=f"stars={stars}")
+                await log_action("low_fb_alert_sent", client_id=client_id, event_id=event_id, details=f"stars={stars}")
             except Exception as e:
-                log_action("support_send_error", client_id=client_id, event_id=event_id, details=f"{e!r}")
-    
-        # 3) предлагаем комментарий или пропустить
-        prompt = f"Дякуємо! Оцінка {stars}⭐️ збережена.\нБажаєте додати короткий коментар?"
+                await log_action("support_send_error", client_id=client_id, event_id=event_id, details=f"{e!r}")
+
+        prompt = f"Дякуємо! Оцінка {stars}⭐️ збережена.\nБажаєте додати короткий коментар?"
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✍️ Написати коментар", callback_data=f"fb:comment:{event_id}:{client_id}")],
             [InlineKeyboardButton(text="⏭ Пропустити", callback_data=f"fb:skip:{event_id}:{client_id}")]
@@ -1388,19 +1261,17 @@ async def fb_callbacks(q: CallbackQuery, state: FSMContext):
         await q.answer()
         return
 
-
-    # Нажали «Пропустити»: fb:skip:<event_id>:<client_id>
     if data.startswith("fb:skip:"):
-        _, _, event_id, client_id = data.split(":")
         await q.message.edit_text("Дякуємо за ваш відгук! ✅")
         await q.answer()
         return
 
-
-    # Запросили ввод комментария: fb:comment:<event_id>:<client_id>
     if data.startswith("fb:comment:"):
-        _, _, event_id, client_id = data.split(":")
-        tg_id = try_get_tg_from_client_id(client_id)
+        _, _, event_id_str, client_id_str = data.split(":")
+        event_id = int(event_id_str)
+        client_id = int(client_id_str)
+
+        tg_id = await try_get_tg_from_client_id(client_id)
         if not tg_id or not q.from_user or q.from_user.id != int(tg_id):
             await q.message.edit_text("Введіть коментар у приватному діалозі з ботом.")
             await q.answer()
@@ -1410,7 +1281,6 @@ async def fb_callbacks(q: CallbackQuery, state: FSMContext):
         await q.message.edit_text("Надішліть, будь ласка, текстовий коментар одним повідомленням.\nАбо надішліть «-», щоб пропустити.")
         await q.answer()
         return
-
 
 @dp.message(FeedbackSG.wait_comment)
 async def fb_wait_comment(m: Message, state: FSMContext):
@@ -1422,137 +1292,120 @@ async def fb_wait_comment(m: Message, state: FSMContext):
     if comment == "-":
         comment = ""
 
-    saved = feedback_upsert(event_id, client_id, comment=comment)
+    saved = await feedback_upsert(event_id, client_id, comment=comment)
     stars = a2i(saved.get("stars"), 0)
 
     await m.answer("Дякуємо! Відгук збережено. ✅")
     await state.clear()
 
-    # если оценка была низкой — досылаем апдейт коммента
     if stars and stars < 4 and comment:
         await route_low_feedback_comment_update(event_id, client_id, comment)
 
-
-
 # =============================== NOTIFY HELPERS ================================
 
-async def notify_event_update(event_id: str, what: str):
-    event = get_event_by_id(event_id)
+async def notify_event_update(event_id: int, what: str):
+    event = await get_event_by_id(event_id)
     if not event:
         return
-    templ = messages_get("update.notice")
+    templ = await messages_get("update.notice")
     body = templ.format(title=event["title"], what=what)
-    for r in rsvp_get_for_event(event_id):
+    for r in await rsvp_get_for_event(event_id):
         if str(r.get("rsvp")) == "going":
-            tg_id = try_get_tg_from_client_id(r.get("client_id"))
+            tg_id = await try_get_tg_from_client_id(r.get("client_id"))
             if tg_id:
                 try:
                     await bot.send_message(chat_id=int(tg_id), text=body)
                 except Exception:
                     pass
 
-async def notify_event_cancel(event_id: str):
-    event = get_event_by_id(event_id)
+async def notify_event_cancel(event_id: int):
+    event = await get_event_by_id(event_id)
     if not event:
         return
-    templ = messages_get("cancel.notice")
+    templ = await messages_get("cancel.notice")
     body = templ.format(title=event["title"])
-    for r in rsvp_get_for_event(event_id):
+    for r in await rsvp_get_for_event(event_id):
         if str(r.get("rsvp")) == "going":
-            tg_id = try_get_tg_from_client_id(r.get("client_id"))
+            tg_id = await try_get_tg_from_client_id(r.get("client_id"))
             if tg_id:
                 try:
                     await bot.send_message(chat_id=int(tg_id), text=body)
                 except Exception:
                     pass
+
 async def send_initial_invites_for_event(event: Dict[str, Any]):
-    """Сразу рассылаем інвайт всем активным клиентам, кто не был на этом типе и не получал інвайт по этому event_id.
-       Плюс антиспам: шлём только для ближайшего события этого типа и только если у клиента нет активного інвайта по типу.
-    """
-    event_id = event.get("event_id", "unknown")
+    """Рассылка начальных приглашений на событие"""
+    event_id = event.get("event_id")
     dt = event_start_dt(event)
     if not dt:
-        log_action("invite_skip", client_id="", event_id=event_id, details="No valid datetime")
+        await log_action("invite_skip", event_id=event_id, details="No valid datetime")
         return
 
-    # Загружаем все события ОДИН раз для оптимизации
-    all_events = get_all_events()
-
-    # 1) Шлём інвайты только для ближайшей даты этого типа
-    if not is_earliest_upcoming_event_of_type(event, all_events):
-        log_action("invite_skip", client_id="", event_id=event_id, details="Not earliest event of type")
+    if not await is_earliest_upcoming_event_of_type(event):
+        await log_action("invite_skip", event_id=event_id, details="Not earliest event of type")
         return
 
-    type_code = a2i(event.get("type"))
-    active_clients = list_active_clients()
+    type_code = event.get("type")
+    active_clients = await list_active_clients()
 
-    # Создаём словарь событий по ID для оптимизации
-    events_by_id = {e.get("event_id"): e for e in all_events}
-
-    # Загружаем Attendance ОДИН раз для оптимизации
-    w_attend = ws(SHEET_ATTEND)
-    attendance_rows = get_all_records(w_attend)
-
-    # Загружаем лог ОДИН раз для оптимизации
-    w_log = ws(SHEET_LOG)
-    log_rows = get_all_records(w_log)
-
-    log_action("invite_process_start", client_id="", event_id=event_id, details=f"Processing {len(active_clients)} active clients, type={type_code}")
+    await log_action("invite_process_start", event_id=event_id, details=f"Processing {len(active_clients)} active clients, type={type_code}")
 
     sent_count = 0
     skip_reasons = {}
 
     for cli in active_clients:
-        cid = cli.get("client_id"); tg_id = cli.get("tg_user_id")
+        cid = cli.get("client_id")
+        tg_id = cli.get("tg_user_id")
+
         if not cid or not tg_id:
             skip_reasons["no_cid_or_tg"] = skip_reasons.get("no_cid_or_tg", 0) + 1
-            log_action("invite_skip", client_id=cid or "unknown", event_id=event_id, details=f"no_cid_or_tg: cid={cid}, tg={tg_id}")
-            continue
-        if client_has_attended_type(cid, type_code, events_by_id, attendance_rows):
-            skip_reasons["already_attended"] = skip_reasons.get("already_attended", 0) + 1
-            log_action("invite_skip", client_id=cid, event_id=event_id, details=f"already_attended type={type_code}")
-            continue
-        # 2) Если у клиента уже есть "активный" інвайт по этому типу — не дублируем
-        if client_has_active_invite_for_type(cid, type_code, events_by_id):
-            skip_reasons["has_active_invite"] = skip_reasons.get("has_active_invite", 0) + 1
-            log_action("invite_skip", client_id=cid, event_id=event_id, details=f"has_active_invite type={type_code}")
-            continue
-        if has_log("invite_sent", cid, event["event_id"], log_rows):
-            skip_reasons["already_sent"] = skip_reasons.get("already_sent", 0) + 1
-            log_action("invite_skip", client_id=cid, event_id=event_id, details=f"already_sent")
+            await log_action("invite_skip", client_id=cid, event_id=event_id, details=f"no_cid_or_tg")
             continue
 
-        body = messages_get("invite.body").format(
+        if await client_has_attended_type(cid, type_code):
+            skip_reasons["already_attended"] = skip_reasons.get("already_attended", 0) + 1
+            await log_action("invite_skip", client_id=cid, event_id=event_id, details=f"already_attended type={type_code}")
+            continue
+
+        if await client_has_active_invite_for_type(cid, type_code):
+            skip_reasons["has_active_invite"] = skip_reasons.get("has_active_invite", 0) + 1
+            await log_action("invite_skip", client_id=cid, event_id=event_id, details=f"has_active_invite type={type_code}")
+            continue
+
+        if await has_log("invite_sent", cid, event_id):
+            skip_reasons["already_sent"] = skip_reasons.get("already_sent", 0) + 1
+            await log_action("invite_skip", client_id=cid, event_id=event_id, details=f"already_sent")
+            continue
+
+        body = (await messages_get("invite.body")).format(
             name=cli.get("full_name","Клієнт"),
             title=event["title"],
             date=fmt_date(dt),
             time=fmt_time(dt),
             description=event["description"]
         )
+
         try:
-            await bot.send_message(chat_id=int(tg_id),
-                                   text=messages_get("invite.title").format(title=event["title"]))
-            await bot.send_message(chat_id=int(tg_id), text=body, reply_markup=kb_rsvp(event["event_id"]))
-            # создаём/обновляем строку RSVP (пока без ответа)
-            rsvp_upsert(event["event_id"], cid, rsvp="")
-            log_action("invite_sent", client_id=cid, event_id=event["event_id"], details="immediate")
+            title_msg = await messages_get("invite.title")
+            await bot.send_message(chat_id=int(tg_id), text=title_msg.format(title=event["title"]))
+            await bot.send_message(chat_id=int(tg_id), text=body, reply_markup=kb_rsvp(event_id))
+            await rsvp_upsert(event_id, cid, rsvp="")
+            await log_action("invite_sent", client_id=cid, event_id=event_id, details="immediate")
             sent_count += 1
         except TelegramRetryAfter as e:
-            log_action("invite_immediate_error", client_id=cid, event_id=event["event_id"], details=f"RetryAfter {e.retry_after}s")
+            await log_action("invite_immediate_error", client_id=cid, event_id=event_id, details=f"RetryAfter {e.retry_after}s")
             skip_reasons["telegram_retry_after"] = skip_reasons.get("telegram_retry_after", 0) + 1
-        except TelegramForbiddenError as e:
-            log_action("invite_immediate_error", client_id=cid, event_id=event["event_id"], details=f"ForbiddenError: user blocked bot or deleted account")
+        except TelegramForbiddenError:
+            await log_action("invite_immediate_error", client_id=cid, event_id=event_id, details=f"ForbiddenError: user blocked bot")
             skip_reasons["user_blocked_bot"] = skip_reasons.get("user_blocked_bot", 0) + 1
         except TelegramBadRequest as e:
-            log_action("invite_immediate_error", client_id=cid, event_id=event["event_id"], details=f"BadRequest: {str(e)}")
+            await log_action("invite_immediate_error", client_id=cid, event_id=event_id, details=f"BadRequest: {str(e)}")
             skip_reasons["telegram_bad_request"] = skip_reasons.get("telegram_bad_request", 0) + 1
         except Exception as e:
-            log_action("invite_immediate_error", client_id=cid, event_id=event["event_id"], details=f"{type(e).__name__}: {str(e)}")
+            await log_action("invite_immediate_error", client_id=cid, event_id=event_id, details=f"{type(e).__name__}: {str(e)}")
             skip_reasons["other_error"] = skip_reasons.get("other_error", 0) + 1
 
-    log_action("invite_process_complete", client_id="", event_id=event_id, details=f"Sent={sent_count}, Skipped={skip_reasons}")
-    flush_logs()  # Принудительно записываем все накопленные логи
-
+    await log_action("invite_process_complete", event_id=event_id, details=f"Sent={sent_count}, Skipped={skip_reasons}")
 
 # =============================== SCHEDULER TICK ================================
 
@@ -1563,75 +1416,78 @@ async def scheduler_tick():
         # ДЛЯ ТЕСТИРОВАНИЯ: уменьшенные интервалы
         REM_24H = 3*60      # 3 минуты вместо 24 часов
         REM_60M = 2*60      # 2 минуты вместо 1 часа
-        FEEDBACK_DELAY = 1*60   # 1 минута после окончания вместо 5 минут
-        JITTER = 60             # секунды, допуск на тик раз в минуту
+        FEEDBACK_DELAY = 1*60   # 1 минута после окончания
+        JITTER = 60             # секунды
 
-        # ДЛЯ ПРОДАКШЕНА раскомментируй это:
+        # ДЛЯ ПРОДАКШЕНА раскомментируй:
         # REM_24H = 24*3600
         # REM_60M = 60*60
         # FEEDBACK_DELAY = 5*60
 
-        for e in list_future_events_sorted():
+        for e in await list_future_events_sorted():
             dt = event_start_dt(e)
             if not dt:
                 continue
 
-            diff = (dt - now).total_seconds()  # до старта, сек
+            diff = (dt - now).total_seconds()
 
-            # === Напоминание за 24 часа ===
+            # Напоминание за 24 часа
             if abs(diff - REM_24H) <= JITTER:
-                for r in rsvp_get_for_event(e["event_id"]):
+                for r in await rsvp_get_for_event(e["event_id"]):
                     cid = r.get("client_id")
-                    tg_id = try_get_tg_from_client_id(cid)
+                    tg_id = await try_get_tg_from_client_id(cid)
                     if not tg_id:
                         continue
-                    if a2i(r.get("reminded_24h"), 0) == 1:
+                    if r.get("reminded_24h"):
                         continue
                     if str(r.get("rsvp")) == "going":
-                        body = messages_get("reminder.24h").format(
+                        body = (await messages_get("reminder.24h")).format(
                             title=e["title"], time=fmt_time(dt), link=e["link"]
                         )
                         try:
                             await bot.send_message(chat_id=int(tg_id), text=body)
-                            rsvp_upsert(e["event_id"], cid, reminded_24h=1)
-                            log_action("remind_24h_sent", client_id=cid, event_id=e["event_id"], details="prod_24h")
+                            await rsvp_upsert(e["event_id"], cid, reminded_24h=True)
+                            await log_action("remind_24h_sent", client_id=cid, event_id=e["event_id"], details="prod_24h")
                         except Exception:
                             pass
 
-            # === Напоминание за 60 минут ===
+            # Напоминание за 60 минут
             if abs(diff - REM_60M) <= JITTER:
-                for r in rsvp_get_for_event(e["event_id"]):
+                for r in await rsvp_get_for_event(e["event_id"]):
                     cid = r.get("client_id")
-                    tg_id = try_get_tg_from_client_id(cid)
+                    tg_id = await try_get_tg_from_client_id(cid)
                     if not tg_id:
                         continue
-                    if a2i(r.get("reminded_60m"), 0) == 1:
+                    if r.get("reminded_60m"):
                         continue
                     if str(r.get("rsvp")) == "going":
-                        body = messages_get("reminder.60m").format(title=e["title"], link=e["link"])
+                        body = (await messages_get("reminder.60m")).format(title=e["title"], link=e["link"])
                         try:
                             await bot.send_message(chat_id=int(tg_id), text=body)
-                            rsvp_upsert(e["event_id"], cid, reminded_60m=1)
-                            log_action("remind_60m_sent", client_id=cid, event_id=e["event_id"], details="prod_60m")
+                            await rsvp_upsert(e["event_id"], cid, reminded_60m=True)
+                            await log_action("remind_60m_sent", client_id=cid, event_id=e["event_id"], details="prod_60m")
                         except Exception:
                             pass
 
-            # === Фидбэк спустя FEEDBACK_DELAY после окончания ===
+            # Фидбэк после окончания
             end_dt = dt + timedelta(minutes=a2i(e.get("duration_min")))
             post_end = (now - end_dt).total_seconds()
             if abs(post_end - FEEDBACK_DELAY) <= JITTER:
-                if has_log("feedback_requested", client_id="", event_id=e["event_id"]):
+                if await has_log("feedback_requested", 0, e["event_id"]):
                     continue
 
-                w_att = ws(SHEET_ATTEND)
-                rows_att = get_all_records(w_att)
-                for r in rows_att:
-                    if str(r.get("event_id")) == e["event_id"] and a2i(r.get("attended")) == 1:
+                async with db_pool.acquire() as conn:
+                    rows_att = await conn.fetch(
+                        "SELECT * FROM attendance WHERE event_id = $1 AND attended = TRUE",
+                        e["event_id"]
+                    )
+
+                    for r in rows_att:
                         cid = r.get("client_id")
-                        tg_id = try_get_tg_from_client_id(cid)
+                        tg_id = await try_get_tg_from_client_id(cid)
                         if not tg_id:
                             continue
-                        text = messages_get("feedback.ask").format(title=e["title"])
+                        text = (await messages_get("feedback.ask")).format(title=e["title"])
                         kb = InlineKeyboardMarkup(inline_keyboard=[[
                             InlineKeyboardButton(text="⭐️1", callback_data=f"fb:{e['event_id']}:{cid}:1"),
                             InlineKeyboardButton(text="⭐️2", callback_data=f"fb:{e['event_id']}:{cid}:2"),
@@ -1644,38 +1500,29 @@ async def scheduler_tick():
                         except Exception:
                             pass
 
-                log_action("feedback_requested", client_id="", event_id=e["event_id"], details=f"delay={FEEDBACK_DELAY}")
+                await log_action("feedback_requested", event_id=e["event_id"], details=f"delay={FEEDBACK_DELAY}")
 
-        # Сбрасываем накопленные логи в конце каждого тика
-        flush_logs()
-
-    except APIError as e:
-        if "429" in str(e) or "Quota exceeded" in str(e):
-            # Квота превышена - пропускаем этот тик, попробуем в следующий раз
-            flush_logs()  # Все равно пытаемся записать логи
-            pass
-        else:
-            # Другая ошибка API - логируем
-            import traceback
-            print(f"API Error in scheduler_tick: {e}\n{traceback.format_exc()}")
     except Exception as e:
-        # Любая другая ошибка - не роняем scheduler
         import traceback
         print(f"Error in scheduler_tick: {e}\n{traceback.format_exc()}")
-        flush_logs()
-
 
 # ================================ STARTUP ======================================
 
 async def on_startup():
+    await init_db()
     scheduler.add_job(scheduler_tick, "interval", seconds=60, id="tick", replace_existing=True)
     scheduler.start()
 
+async def on_shutdown():
+    await close_db()
+
 async def main():
-    # на всякий случай: снимаем webhook, чтобы не было конфликта с polling
     await bot.delete_webhook(drop_pending_updates=True)
     await on_startup()
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    try:
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    finally:
+        await on_shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
