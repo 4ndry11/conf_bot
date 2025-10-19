@@ -34,9 +34,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
 
-SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", "-1003053461710"))
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "f7T9vQ1111wLp2Gx8Z")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://admin:HixmeIYPVRXhhqDDn2k96ozPQdwjHWVJ@dpg-d3qc93odl3ps73bqudv0-a.frankfurt-postgres.render.com/db_zv_conf")
+SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", ""))
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
 TZ = ZoneInfo(TIMEZONE)
 
@@ -80,7 +80,11 @@ def now_kyiv() -> datetime:
     return utc_now.astimezone(TZ)
 
 def iso_dt(dt: Optional[datetime] = None) -> str:
+    """Конвертирует datetime в строку в киевском времени"""
     dt = dt or now_kyiv()
+    # Если datetime имеет timezone info, конвертируем в киевское время
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(TZ)
     return dt.strftime("%Y-%m-%d %H:%M")
 
 def parse_dt(s: str) -> Optional[datetime]:
@@ -98,9 +102,15 @@ def parse_dt(s: str) -> Optional[datetime]:
         return None
 
 def fmt_date(dt: datetime) -> str:
+    """Форматирует дату в киевском времени"""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(TZ)
     return dt.strftime("%d.%m.%Y")
 
 def fmt_time(dt: datetime) -> str:
+    """Форматирует время в киевском времени"""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(TZ)
     return dt.strftime("%H:%M")
 
 def short_uuid(n: int = 8) -> str:
@@ -305,14 +315,14 @@ async def delete_event(event_id: int) -> None:
         await log_action("event_canceled", event_id=event_id, details="deleted")
 
 def event_start_dt(event: Dict[str, Any]) -> Optional[datetime]:
-    """Получение datetime начала события (aware datetime)"""
+    """Получение datetime начала события (aware datetime в киевском времени)"""
     start_at = event.get("start_at")
     if isinstance(start_at, datetime):
-        # Если есть timezone info — возвращаем как есть, иначе локализуем
+        # Если есть timezone info — конвертируем в киевское время
         if start_at.tzinfo:
-            return start_at
+            return start_at.astimezone(TZ)
         else:
-            # Корректная локализация naive datetime
+            # Корректная локализация naive datetime (предполагаем, что это уже киевское время)
             return datetime(
                 start_at.year, start_at.month, start_at.day,
                 start_at.hour, start_at.minute, start_at.second,
