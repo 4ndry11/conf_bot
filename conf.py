@@ -98,6 +98,14 @@ def delete_row(w: gspread.Worksheet, row_idx: int) -> None:
 
 # =============================== HELPERS =======================================
 
+async def safe_edit_message(message: Message, text: str, reply_markup=None, parse_mode=None):
+    """Безопасное редактирование сообщения с обработкой ошибки 'message is not modified'."""
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+
 def now_kyiv() -> datetime:
     return datetime.now(TZ)
 
@@ -1104,13 +1112,13 @@ async def cb_rsvp(q: CallbackQuery):
     _, event_id, action = parts
     cli = get_client_by_tg(q.from_user.id)
     if not cli:
-        await q.message.edit_text("Будь ласка, зареєструйтесь командою /start.")
+        await safe_edit_message(q.message, "Будь ласка, зареєструйтесь командою /start.")
         await q.answer()
         return
     client_id = cli["client_id"]
     event = get_event_by_id(event_id)
     if not event:
-        await q.message.edit_text("Подію не знайдено.")
+        await safe_edit_message(q.message, "Подію не знайдено.")
         await q.answer()
         return
 
@@ -1118,17 +1126,17 @@ async def cb_rsvp(q: CallbackQuery):
         rsvp_upsert(event_id, client_id, rsvp="going")
         mark_attendance(event_id, client_id, 1)
         log_action("rsvp_yes", client_id=client_id, event_id=event_id, details="")
-        await q.message.edit_text("Дякуємо! Участь підтверджено ✅")
+        await safe_edit_message(q.message, "Дякуємо! Участь підтверджено ✅")
         await q.answer()
         return
 
     if action == "declined":
         rsvp_upsert(event_id, client_id, rsvp="declined")
         log_action("rsvp_no", client_id=client_id, event_id=event_id, details="")
-    
+
         alt = list_alternative_events_same_type(a2i(event.get("type")), event_id)
         if not alt:
-            await q.message.edit_text("Добре! Тоді очікуйте нове запрошення на іншу дату.")
+            await safe_edit_message(q.message, "Добре! Тоді очікуйте нове запрошення на іншу дату.")
         else:
             rows = []
             for a in alt[:8]:  # не больше 8 кнопок
@@ -1137,9 +1145,10 @@ async def cb_rsvp(q: CallbackQuery):
                 # Кнопка выбирает альтернативную дату
                 rows.append([InlineKeyboardButton(text=when, callback_data=f"alt:pick:{a['event_id']}")])
             rows.append([InlineKeyboardButton(text="❌ Закрити", callback_data="noop")])
-    
+
             title_for_info = event.get("title", "подія")
-            await q.message.edit_text(
+            await safe_edit_message(
+                q.message,
                 f"Можливі альтернативні дати за темою «{title_for_info}»:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
         )
@@ -1418,16 +1427,20 @@ async def send_initial_invites_for_event(event: Dict[str, Any]):
         cid = cli.get("client_id"); tg_id = cli.get("tg_user_id")
         if not cid or not tg_id:
             skip_reasons["no_cid_or_tg"] = skip_reasons.get("no_cid_or_tg", 0) + 1
+            log_action("invite_skip", client_id=cid or "unknown", event_id=event_id, details=f"no_cid_or_tg: cid={cid}, tg={tg_id}")
             continue
         if client_has_attended_type(cid, type_code, events_by_id, attendance_rows):
             skip_reasons["already_attended"] = skip_reasons.get("already_attended", 0) + 1
+            log_action("invite_skip", client_id=cid, event_id=event_id, details=f"already_attended type={type_code}")
             continue
         # 2) Если у клиента уже есть "активный" інвайт по этому типу — не дублируем
         if client_has_active_invite_for_type(cid, type_code, events_by_id):
             skip_reasons["has_active_invite"] = skip_reasons.get("has_active_invite", 0) + 1
+            log_action("invite_skip", client_id=cid, event_id=event_id, details=f"has_active_invite type={type_code}")
             continue
         if has_log("invite_sent", cid, event["event_id"], log_rows):
             skip_reasons["already_sent"] = skip_reasons.get("already_sent", 0) + 1
+            log_action("invite_skip", client_id=cid, event_id=event_id, details=f"already_sent")
             continue
 
         body = messages_get("invite.body").format(
@@ -1445,8 +1458,18 @@ async def send_initial_invites_for_event(event: Dict[str, Any]):
             rsvp_upsert(event["event_id"], cid, rsvp="")
             log_action("invite_sent", client_id=cid, event_id=event["event_id"], details="immediate")
             sent_count += 1
+        except TelegramRetryAfter as e:
+            log_action("invite_immediate_error", client_id=cid, event_id=event["event_id"], details=f"RetryAfter {e.retry_after}s")
+            skip_reasons["telegram_retry_after"] = skip_reasons.get("telegram_retry_after", 0) + 1
+        except TelegramForbiddenError as e:
+            log_action("invite_immediate_error", client_id=cid, event_id=event["event_id"], details=f"ForbiddenError: user blocked bot or deleted account")
+            skip_reasons["user_blocked_bot"] = skip_reasons.get("user_blocked_bot", 0) + 1
+        except TelegramBadRequest as e:
+            log_action("invite_immediate_error", client_id=cid, event_id=event["event_id"], details=f"BadRequest: {str(e)}")
+            skip_reasons["telegram_bad_request"] = skip_reasons.get("telegram_bad_request", 0) + 1
         except Exception as e:
             log_action("invite_immediate_error", client_id=cid, event_id=event["event_id"], details=f"{type(e).__name__}: {str(e)}")
+            skip_reasons["other_error"] = skip_reasons.get("other_error", 0) + 1
 
     log_action("invite_process_complete", client_id="", event_id=event_id, details=f"Sent={sent_count}, Skipped={skip_reasons}")
 
@@ -1457,15 +1480,15 @@ async def scheduler_tick():
     now = now_kyiv()
 
     # ДЛЯ ТЕСТИРОВАНИЯ: уменьшенные интервалы
-    # REM_24H = 3*60      # 3 минуты вместо 24 часов
-    # REM_60M = 2*60      # 2 минуты вместо 1 часа
-    # FEEDBACK_DELAY = 1*60   # 1 минута после окончания вместо 5 минут
+    REM_24H = 3*60      # 3 минуты вместо 24 часов
+    REM_60M = 2*60      # 2 минуты вместо 1 часа
+    FEEDBACK_DELAY = 1*60   # 1 минута после окончания вместо 5 минут
     JITTER = 60             # секунды, допуск на тик раз в минуту
 
     # ДЛЯ ПРОДАКШЕНА раскомментируй это:
-    REM_24H = 24*3600
-    REM_60M = 60*60
-    FEEDBACK_DELAY = 5*60
+    # REM_24H = 24*3600
+    # REM_60M = 60*60
+    # FEEDBACK_DELAY = 5*60
 
     for e in list_future_events_sorted():
         dt = event_start_dt(e)
