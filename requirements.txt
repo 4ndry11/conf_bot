@@ -1,5 +1,4 @@
-aiogram==3.4.1
+aiogram==3.7.0
+asyncpg==0.29.0
 APScheduler==3.10.4
-gspread==6.2.1
-google-auth==2.41.0
-tzdata>=2025.2
+tzdata==2024.1
