@@ -34,9 +34,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
 
-SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", ""))
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", "-1003053461710"))
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "f7T9vQ1111wLp2Gx8Z")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://admin:HixmeIYPVRXhhqDDn2k96ozPQdwjHWVJ@dpg-d3qc93odl3ps73bqudv0-a.frankfurt-postgres.render.com/db_zv_conf")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
 TZ = ZoneInfo(TIMEZONE)
 
@@ -87,8 +87,13 @@ def parse_dt(s: str) -> Optional[datetime]:
     """Парсит строку в aware datetime (с timezone info для Киева)"""
     try:
         naive_dt = datetime.strptime(s.strip(), "%Y-%m-%d %H:%M")
-        # Локализуем в киевскую зону
-        return naive_dt.replace(tzinfo=TZ)
+        # Корректно локализуем в киевскую зону (учитывает DST)
+        # Используем конструктор datetime с tzinfo напрямую
+        return datetime(
+            naive_dt.year, naive_dt.month, naive_dt.day,
+            naive_dt.hour, naive_dt.minute, naive_dt.second,
+            naive_dt.microsecond, tzinfo=TZ
+        )
     except Exception:
         return None
 
@@ -304,7 +309,15 @@ def event_start_dt(event: Dict[str, Any]) -> Optional[datetime]:
     start_at = event.get("start_at")
     if isinstance(start_at, datetime):
         # Если есть timezone info — возвращаем как есть, иначе локализуем
-        return start_at if start_at.tzinfo else start_at.replace(tzinfo=TZ)
+        if start_at.tzinfo:
+            return start_at
+        else:
+            # Корректная локализация naive datetime
+            return datetime(
+                start_at.year, start_at.month, start_at.day,
+                start_at.hour, start_at.minute, start_at.second,
+                start_at.microsecond, tzinfo=TZ
+            )
     if isinstance(start_at, str):
         return parse_dt(start_at)
     return None
@@ -1425,15 +1438,16 @@ async def scheduler_tick():
         now = now_kyiv()
 
         # ДЛЯ ТЕСТИРОВАНИЯ: уменьшенные интервалы
-        REM_24H = 3*60      # 3 минуты вместо 24 часов
-        REM_60M = 2*60      # 2 минуты вместо 1 часа
+        REM_24H = 2*60      # 2 минуты вместо 24 часов (напоминание за "24ч")
+        REM_60M = 1*60      # 1 минута вместо 1 часа (напоминание за "1ч")
         FEEDBACK_DELAY = 1*60   # 1 минута после окончания
-        JITTER = 60             # секунды
+        JITTER = 30             # 30 секунд для точности срабатывания
 
         # ДЛЯ ПРОДАКШЕНА раскомментируй:
         # REM_24H = 24*3600
         # REM_60M = 60*60
         # FEEDBACK_DELAY = 5*60
+        # JITTER = 60
 
         for e in await list_future_events_sorted():
             dt = event_start_dt(e)
