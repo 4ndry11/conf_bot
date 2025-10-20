@@ -150,14 +150,14 @@ async def messages_get(key: str, lang: str = "uk") -> str:
         pass
 
     FALLBACKS = {
-        "invite.title": "Запрошення на зустріч: {title}",
-        "invite.body": "{name}, запрошуємо на зустріч: {title}\n🗓 {date} о {time} (Київ)\nℹ️ {description}\nВиберіть варіант нижче:\n[✅ Так, буду] [🚫 Не зможу] [🔔 Нагадати за 24 год]",
-        "reminder.60m": "⏰ Нагадуємо: через 1 год почнеться {title}. Посилання: {link}",
-        "feedback.ask": "Дякуємо за участь у *{title}*.\nОцініть, будь ласка:\n1) Корисність: ⭐️1–5\n2) Чи зрозумілі наступні кроки? ✅ Так / ⚠️ Частково / ❌ Ні\nМожна додати коментар: [✍️ Написати відгук]",
-        "reminder.24h": "🔔 Нагадуємо: завтра о {time} відбудеться {title}.\nПосилання: {link}",
-        "update.notice": "🛠 Оновлення зустрічі {title}.\nЗверніть увагу: {what}",
-        "cancel.notice": "❌ Зустріч {title} скасовано. Ми надішлемо нову дату найближчим часом.",
-        "help.body": "👋 Це бот для запрошень на наші онлайн-зустрічі.\n\nВи отримуватимете інвайти та нагадування. Кнопки під повідомленням:\n• ✅ Так, буду — підтвердити участь (ми нагадаємо за 24 год і за 1 год)\n• 🚫 Не зможу — пропустити цю дату (ми запропонуємо іншу)\n• 🔔 Нагадати за 24 год — якщо ще не вирішили.",
+        "invite.title": "Запрошення на конференцію: {title}",
+        "invite.body": "Шановний(-а) {name}!\n\nЗапрошуємо Вас на конференцію: {title}\n🗓 Дата: {date}\n⏰ Час: {time} (за київським часом)\nℹ️ {description}\n\nБудь ласка, підтвердіть Вашу участь за допомогою кнопок нижче.",
+        "reminder.60m": "⏰ Нагадування: через 1 годину почнеться конференція {title}.\n🔗 Посилання для підключення: {link}",
+        "feedback.ask": "Дякуємо за участь у конференції «{title}»!\n\nБудь ласка, оцініть захід за шкалою від 1 до 5 зірок.\nВи також можете залишити коментар.",
+        "reminder.24h": "🔔 Нагадування: завтра о {time} відбудеться конференція {title}.\n🔗 Посилання для підключення: {link}",
+        "update.notice": "🛠 Інформація про зміни\n\nУ конференції «{title}» відбулися зміни:\n{what}\n\nДякуємо за розуміння!",
+        "cancel.notice": "❌ Інформація про скасування\n\nКонференцію «{title}» скасовано.\nМи повідомимо Вас про нову дату найближчим часом.",
+        "help.body": "Вітаємо!\n\nЦей бот призначений для надсилання запрошень на наші онлайн-конференції.\n\nВи отримуватимете запрошення та нагадування про заходи.\n\nКнопки під повідомленням:\n• ✅ Так, буду — підтвердити участь (Ви отримаєте нагадування за 24 години та за 1 годину до початку)\n• 🚫 Не зможу — повідомити про відсутність (Ви зможете обрати альтернативну дату)\n• 🔔 Нагадати за 24 год — якщо Ви ще не визначилися",
     }
     return FALLBACKS.get(key, "")
 
@@ -586,20 +586,20 @@ async def get_event_statistics(event_id: int) -> Dict[str, Any]:
 async def build_types_overview_text(cli: Dict[str, Any]) -> str:
     """Построение обзорного текста по типам событий"""
     text = (
-        "✅ Ви підключені до розсилки на конференції.\n"
-        "Надсилатимемо інвайти на найближчі події.\n\n"
+        "✅ Ви успішно зареєстровані для отримання запрошень на конференції.\n"
+        "Ви отримуватимете запрошення на найближчі заходи.\n\n"
         "Доступні типи конференцій:\n"
     )
     rows = await get_eventtypes_active()
     if not rows:
-        return text + "Наразі немає активних типів."
+        return text + "На даний момент немає активних типів конференцій."
 
     lines = []
     for rt in rows:
         tcode = rt.get("type_code")
         title = str(rt.get("title"))
         attended = await client_has_attended_type(cli['client_id'], tcode)
-        flag = "✅ Був(ла)" if attended else "⭕️ Ще не був(ла)"
+        flag = "✅ Відвідано" if attended else "⭕️ Ще не відвідували"
         lines.append(f"• {title} — {flag}")
 
     return text + "\n".join(lines)
@@ -714,7 +714,7 @@ async def cmd_start(m: Message, state: FSMContext):
     cli = await get_client_by_tg(m.from_user.id)
     if not cli or not cli.get("full_name") or not cli.get("phone"):
         await state.set_state(RegisterSG.wait_name)
-        await m.answer("👋 Привіт! Вкажіть, будь ласка, Ваше ПІБ (українською).")
+        await m.answer("Доброго дня! Будь ласка, вкажіть Ваше прізвище, ім'я та по батькові.")
         return
 
     await send_welcome_and_types_list(m, cli)
@@ -734,17 +734,17 @@ async def cmd_help(m: Message):
 async def reg_wait_name(m: Message, state: FSMContext):
     full_name = (m.text or "").strip()
     if len(full_name) < 3:
-        await m.answer("Будь ласка, введіть коректне ПІБ (не менше 3 символів).")
+        await m.answer("Будь ласка, введіть повне прізвище, ім'я та по батькові.")
         return
     await state.update_data(full_name=full_name)
     await state.set_state(RegisterSG.wait_phone)
-    await m.answer("Вкажіть номер телефону у форматі 380XXXXXXXXX:")
+    await m.answer("Будь ласка, вкажіть номер телефону у форматі 380XXXXXXXXX:")
 
 @dp.message(RegisterSG.wait_phone)
 async def reg_wait_phone(m: Message, state: FSMContext):
     phone = normalize_phone(m.text or "")
     if not phone:
-        await m.answer("Невірний формат. Приклад: 380671234567. Спробуйте ще раз:")
+        await m.answer("Невірний формат номера. Приклад: 380671234567. Будь ласка, спробуйте ще раз:")
         return
     data = await state.get_data()
     cli = await upsert_client(m.from_user.id, data["full_name"], phone)
@@ -755,7 +755,7 @@ async def reg_wait_phone(m: Message, state: FSMContext):
 async def show_my_conferences(m: Message):
     cli = await get_client_by_tg(m.from_user.id)
     if not cli:
-        await m.answer("Будь ласка, зареєструйтесь командою /start.", reply_markup=kb_client_main())
+        await m.answer("Будь ласка, зареєструйтеся за допомогою команди /start.", reply_markup=kb_client_main())
         return
     text = await build_types_overview_text(cli)
     await m.answer(text, reply_markup=kb_client_main())
@@ -1109,22 +1109,36 @@ async def cb_rsvp(q: CallbackQuery):
 
     cli = await get_client_by_tg(q.from_user.id)
     if not cli:
-        await safe_edit_message(q.message, "Будь ласка, зареєструйтесь командою /start.")
+        await safe_edit_message(q.message, "Будь ласка, зареєструйтеся за допомогою команди /start.")
         await q.answer()
         return
 
     client_id = cli["client_id"]
     event = await get_event_by_id(event_id)
     if not event:
-        await safe_edit_message(q.message, "Подію не знайдено.")
+        await safe_edit_message(q.message, "Конференцію не знайдено.")
         await q.answer()
+        return
+
+    # Проверяем, не началась ли уже конференция
+    dt = event_start_dt(event)
+    if dt and dt <= now_kyiv():
+        await safe_edit_message(
+            q.message,
+            q.message.text + "\n\n⚠️ Конференція вже почалася. Підтвердження участі недоступне."
+        )
+        await q.answer("Конференція вже почалася")
         return
 
     if action == "going":
         await rsvp_upsert(event_id, client_id, rsvp="going")
         await mark_attendance(event_id, client_id, True)
         await log_action("rsvp_yes", client_id=client_id, event_id=event_id, details="")
-        await safe_edit_message(q.message, "Дякуємо! Участь підтверджено ✅")
+
+        # Сохраняем исходное сообщение и добавляем подтверждение
+        original_text = q.message.text or ""
+        new_text = original_text + "\n\n✅ Дякуємо! Вашу участь підтверджено."
+        await safe_edit_message(q.message, new_text)
         await q.answer()
         return
 
@@ -1134,7 +1148,10 @@ async def cb_rsvp(q: CallbackQuery):
 
         alt = await list_alternative_events_same_type(a2i(event.get("type")), event_id)
         if not alt:
-            await safe_edit_message(q.message, "Добре! Тоді очікуйте нове запрошення на іншу дату.")
+            # Сохраняем исходное сообщение и добавляем ответ
+            original_text = q.message.text or ""
+            new_text = original_text + "\n\n❌ Дякуємо за відповідь. Ми надішлемо Вам запрошення на іншу дату."
+            await safe_edit_message(q.message, new_text)
         else:
             rows = []
             for a in alt[:8]:
@@ -1143,10 +1160,13 @@ async def cb_rsvp(q: CallbackQuery):
                 rows.append([InlineKeyboardButton(text=when, callback_data=f"alt:pick:{a['event_id']}")])
             rows.append([InlineKeyboardButton(text="❌ Закрити", callback_data="noop")])
 
-            title_for_info = event.get("title", "подія")
+            title_for_info = event.get("title", "конференція")
+            # Сохраняем исходное сообщение
+            original_text = q.message.text or ""
+            new_text = original_text + f"\n\nАльтернативні дати проведення конференції «{title_for_info}»:"
             await safe_edit_message(
                 q.message,
-                f"Можливі альтернативні дати за темою «{title_for_info}»:",
+                new_text,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
             )
     await q.answer()
@@ -1165,7 +1185,11 @@ async def claim_feedback(q: CallbackQuery):
     owner = f"@{q.from_user.username}" if q.from_user and q.from_user.username else f"id:{q.from_user.id}"
     await feedback_assign_owner(event_id, client_id, owner)
     await log_action("complaint_taken", client_id=client_id, event_id=event_id, details=f"owner={owner}")
-    await q.message.edit_text(f"✅ Взято в роботу ({owner})")
+
+    # Сохраняем исходное сообщение и добавляем информацию о взятии в работу
+    original_text = q.message.text or ""
+    new_text = original_text + f"\n\n✅ Взято в роботу ({owner})"
+    await q.message.edit_text(new_text)
     await q.answer()
 
 @dp.callback_query(F.data.startswith("alt:pick:"))
@@ -1178,14 +1202,14 @@ async def alt_pick(q: CallbackQuery):
     alt_event_id = int(parts[2])
     cli = await get_client_by_tg(q.from_user.id)
     if not cli:
-        await q.message.edit_text("Будь ласка, зареєструйтесь командою /start.")
+        await q.message.edit_text("Будь ласка, зареєструйтеся за допомогою команди /start.")
         await q.answer()
         return
 
     client_id = cli["client_id"]
     alt_event = await get_event_by_id(alt_event_id)
     if not alt_event:
-        await q.message.edit_text("Альтернативну дату не знайдено.")
+        await q.message.edit_text("На жаль, обрану дату не знайдено.")
         await q.answer()
         return
 
@@ -1196,10 +1220,10 @@ async def alt_pick(q: CallbackQuery):
     dt = event_start_dt(alt_event)
     when = f"{fmt_date(dt)} о {fmt_time(dt)}" if dt else alt_event.get("start_at", "")
     await q.message.edit_text(
-        f"✅ Участь підтверджено на альтернативну дату:\n"
-        f"• {alt_event.get('title','')}\n"
-        f"• 🗓 {when}\n"
-        f"• 🔗 {alt_event.get('link','')}"
+        f"✅ Дякуємо! Вашу участь підтверджено.\n\n"
+        f"Конференція: {alt_event.get('title','')}\n"
+        f"🗓 Дата та час: {when}\n"
+        f"🔗 Посилання: {alt_event.get('link','')}"
     )
     await q.answer()
 
@@ -1286,7 +1310,7 @@ async def fb_callbacks(q: CallbackQuery, state: FSMContext):
             except Exception as e:
                 await log_action("support_send_error", client_id=client_id, event_id=event_id, details=f"{e!r}")
 
-        prompt = f"Дякуємо! Оцінка {stars}⭐️ збережена.\nБажаєте додати короткий коментар?"
+        prompt = f"Дякуємо! Вашу оцінку {stars}⭐️ збережено.\nБажаєте додати коментар?"
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✍️ Написати коментар", callback_data=f"fb:comment:{event_id}:{client_id}")],
             [InlineKeyboardButton(text="⏭ Пропустити", callback_data=f"fb:skip:{event_id}:{client_id}")]
@@ -1296,7 +1320,7 @@ async def fb_callbacks(q: CallbackQuery, state: FSMContext):
         return
 
     if data.startswith("fb:skip:"):
-        await q.message.edit_text("Дякуємо за ваш відгук! ✅")
+        await q.message.edit_text("Дякуємо за Ваш відгук! ✅")
         await q.answer()
         return
 
@@ -1307,12 +1331,12 @@ async def fb_callbacks(q: CallbackQuery, state: FSMContext):
 
         tg_id = await try_get_tg_from_client_id(client_id)
         if not tg_id or not q.from_user or q.from_user.id != int(tg_id):
-            await q.message.edit_text("Введіть коментар у приватному діалозі з ботом.")
+            await q.message.edit_text("Будь ласка, введіть коментар у приватному діалозі з ботом.")
             await q.answer()
             return
         await state.set_state(FeedbackSG.wait_comment)
         await state.update_data(event_id=event_id, client_id=client_id)
-        await q.message.edit_text("Надішліть, будь ласка, текстовий коментар одним повідомленням.\nАбо надішліть «-», щоб пропустити.")
+        await q.message.edit_text("Будь ласка, надішліть Ваш коментар одним повідомленням.\nДля пропуску надішліть символ «-».")
         await q.answer()
         return
 
@@ -1329,7 +1353,7 @@ async def fb_wait_comment(m: Message, state: FSMContext):
     saved = await feedback_upsert(event_id, client_id, comment=comment)
     stars = a2i(saved.get("stars"), 0)
 
-    await m.answer("Дякуємо! Відгук збережено. ✅")
+    await m.answer("Дякуємо! Ваш відгук збережено. ✅")
     await state.clear()
 
     if stars and stars < 4 and comment:
