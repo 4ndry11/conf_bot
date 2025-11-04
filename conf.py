@@ -476,6 +476,26 @@ async def client_has_active_invite_for_type(client_id: int, type_code: int) -> b
         )
         return row is not None
 
+async def client_has_confirmed_event_at_time(client_id: int, start_dt: datetime, duration_min: int) -> bool:
+    """Проверка, есть ли у клиента подтвержденная конференция на это же время"""
+    async with db_pool.acquire() as conn:
+        # Проверяем пересечение интервалов времени
+        # Новая конференция: [start_dt, start_dt + duration_min]
+        # Существующая: [e.start_at, e.start_at + e.duration_min]
+        end_dt = start_dt + timedelta(minutes=duration_min)
+
+        row = await conn.fetchrow(
+            """SELECT 1 FROM rsvp r
+               JOIN events e ON r.event_id = e.event_id
+               WHERE r.client_id = $1
+                 AND r.rsvp = 'going'
+                 AND e.start_at < $2
+                 AND (e.start_at + (e.duration_min || ' minutes')::INTERVAL) > $3
+               LIMIT 1""",
+            client_id, end_dt, start_dt
+        )
+        return row is not None
+
 async def is_earliest_upcoming_event_of_type(event: Dict[str, Any]) -> bool:
     """Проверка, является ли событие самым ранним предстоящим событием данного типа"""
     now = now_kyiv()
@@ -604,12 +624,134 @@ async def build_types_overview_text(cli: Dict[str, Any]) -> str:
 
     return text + "\n".join(lines)
 
+async def get_client_statistics(client_id: int) -> Dict[str, Any]:
+    """Получение статистики клиента"""
+    async with db_pool.acquire() as conn:
+        # Количество посещенных конференций
+        attended_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM attendance WHERE client_id = $1 AND attended = TRUE",
+            client_id
+        )
+
+        # Список посещенных событий с деталями
+        attended_events = await conn.fetch(
+            """SELECT e.event_id, e.title, e.start_at, e.type
+               FROM attendance a
+               JOIN events e ON a.event_id = e.event_id
+               WHERE a.client_id = $1 AND a.attended = TRUE
+               ORDER BY e.start_at DESC""",
+            client_id
+        )
+
+        # Количество подтвержденных (но не посещенных еще) конференций
+        confirmed_count = await conn.fetchval(
+            """SELECT COUNT(*) FROM rsvp r
+               JOIN events e ON r.event_id = e.event_id
+               WHERE r.client_id = $1 AND r.rsvp = 'going' AND e.start_at >= $2""",
+            client_id, now_kyiv()
+        )
+
+        # Список подтвержденных будущих событий
+        confirmed_events = await conn.fetch(
+            """SELECT e.event_id, e.title, e.start_at, e.type
+               FROM rsvp r
+               JOIN events e ON r.event_id = e.event_id
+               WHERE r.client_id = $1 AND r.rsvp = 'going' AND e.start_at >= $2
+               ORDER BY e.start_at""",
+            client_id, now_kyiv()
+        )
+
+        # Типы конференций, которые клиент посетил
+        attended_types = await conn.fetch(
+            """SELECT DISTINCT e.type, et.title
+               FROM attendance a
+               JOIN events e ON a.event_id = e.event_id
+               JOIN event_types et ON e.type = et.type_code
+               WHERE a.client_id = $1 AND a.attended = TRUE""",
+            client_id
+        )
+
+        # Все типы конференций
+        all_types = await get_eventtypes_active()
+
+        return {
+            "attended_count": attended_count or 0,
+            "attended_events": [dict(row) for row in attended_events],
+            "confirmed_count": confirmed_count or 0,
+            "confirmed_events": [dict(row) for row in confirmed_events],
+            "attended_types": [dict(row) for row in attended_types],
+            "total_types": len(all_types),
+            "completed_types": len(attended_types)
+        }
+
+async def list_clients_by_filter(filter_type: str = "all") -> List[Dict[str, Any]]:
+    """Получение списка клиентов по фильтру"""
+    async with db_pool.acquire() as conn:
+        if filter_type == "all":
+            # Все активные клиенты
+            rows = await conn.fetch(
+                """SELECT c.*,
+                   (SELECT COUNT(*) FROM attendance a WHERE a.client_id = c.client_id AND a.attended = TRUE) as attended_count
+                   FROM clients c
+                   WHERE c.status = 'active'
+                   ORDER BY c.last_seen_at DESC"""
+            )
+        elif filter_type == "completed":
+            # Клиенты, прошедшие все типы конференций
+            all_types = await get_eventtypes_active()
+            total_types = len(all_types)
+
+            rows = await conn.fetch(
+                """SELECT c.*,
+                   COUNT(DISTINCT e.type) as completed_types,
+                   COUNT(*) as attended_count
+                   FROM clients c
+                   JOIN attendance a ON c.client_id = a.client_id
+                   JOIN events e ON a.event_id = e.event_id
+                   WHERE c.status = 'active' AND a.attended = TRUE
+                   GROUP BY c.client_id
+                   HAVING COUNT(DISTINCT e.type) >= $1
+                   ORDER BY c.last_seen_at DESC""",
+                total_types
+            )
+        elif filter_type == "active":
+            # Клиенты с подтвержденными будущими конференциями
+            rows = await conn.fetch(
+                """SELECT DISTINCT c.*,
+                   (SELECT COUNT(*) FROM attendance a WHERE a.client_id = c.client_id AND a.attended = TRUE) as attended_count
+                   FROM clients c
+                   JOIN rsvp r ON c.client_id = r.client_id
+                   JOIN events e ON r.event_id = e.event_id
+                   WHERE c.status = 'active'
+                   AND r.rsvp = 'going'
+                   AND e.start_at >= $1
+                   ORDER BY c.last_seen_at DESC""",
+                now_kyiv()
+            )
+        elif filter_type == "never":
+            # Клиенты, которые не были ни на одной конференции
+            rows = await conn.fetch(
+                """SELECT c.*, 0 as attended_count
+                   FROM clients c
+                   WHERE c.status = 'active'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM attendance a
+                       WHERE a.client_id = c.client_id AND a.attended = TRUE
+                   )
+                   ORDER BY c.created_at DESC"""
+            )
+        else:
+            rows = []
+
+        return [dict(row) for row in rows]
+
 # ============================== KEYBOARDS ======================================
 
 def kb_admin_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Додати конференцію", callback_data="admin:add")],
         [InlineKeyboardButton(text="📋 Список конференцій", callback_data="admin:list:0")],
+        [InlineKeyboardButton(text="👥 Клієнти", callback_data="admin:clients:menu")],
     ])
 
 def kb_rsvp(event_id: int) -> InlineKeyboardMarkup:
@@ -660,6 +802,20 @@ def kb_client_main() -> ReplyKeyboardMarkup:
         keyboard=[[KeyboardButton(text="📋 Мої конференції")]],
         resize_keyboard=True
     )
+
+def kb_clients_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Всі клієнти", callback_data="admin:clients:list:all:0")],
+        [InlineKeyboardButton(text="✅ Пройшли всі конфи", callback_data="admin:clients:list:completed:0")],
+        [InlineKeyboardButton(text="🔄 Активні (є майбутні)", callback_data="admin:clients:list:active:0")],
+        [InlineKeyboardButton(text="❌ Не були ні на одній", callback_data="admin:clients:list:never:0")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:home")],
+    ])
+
+def kb_client_detail(client_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад до списку", callback_data="admin:clients:menu")],
+    ])
 
 # ============================== STATE / MEMORY =================================
 
@@ -1096,6 +1252,143 @@ async def admin_cancel(q: CallbackQuery):
         await q.answer()
         return
 
+# ---------- Управление клиентами ----------
+
+@dp.callback_query(F.data == "admin:clients:menu")
+async def admin_clients_menu(q: CallbackQuery):
+    if q.from_user.id not in ADMINS:
+        await q.answer()
+        return
+    await q.message.edit_text("👥 Управління клієнтами:\n\nОберіть категорію:", reply_markup=kb_clients_menu())
+    await q.answer()
+
+@dp.callback_query(F.data.startswith("admin:clients:list:"))
+async def admin_clients_list(q: CallbackQuery):
+    if q.from_user.id not in ADMINS:
+        await q.answer()
+        return
+
+    parts = q.data.split(":")
+    if len(parts) != 5:
+        await q.answer()
+        return
+
+    filter_type = parts[3]
+    page = int(parts[4])
+
+    clients = await list_clients_by_filter(filter_type)
+
+    filter_names = {
+        "all": "Всі клієнти",
+        "completed": "Пройшли всі конференції",
+        "active": "Активні (є майбутні конференції)",
+        "never": "Не були ні на одній конференції"
+    }
+
+    per = 10
+    total = len(clients)
+    start = page * per
+    end = start + per
+    subset = clients[start:end]
+
+    if not subset and page != 0:
+        page = 0
+        start, end = 0, per
+        subset = clients[start:end]
+
+    buttons = []
+    for c in subset:
+        name = c.get('full_name', 'Без імені')
+        attended = c.get('attended_count', 0)
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{name} ({attended} конф.)",
+                callback_data=f"admin:client:view:{c['client_id']}"
+            )
+        ])
+
+    nav = []
+    if start > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin:clients:list:{filter_type}:{page-1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin:clients:list:{filter_type}:{page+1}"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:clients:menu")])
+
+    text = f"👥 {filter_names.get(filter_type, 'Клієнти')}\n\nВсього: {total}"
+    await q.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await q.answer()
+
+@dp.callback_query(F.data.startswith("admin:client:view:"))
+async def admin_client_view(q: CallbackQuery):
+    if q.from_user.id not in ADMINS:
+        await q.answer()
+        return
+
+    parts = q.data.split(":")
+    if len(parts) != 4:
+        await q.answer()
+        return
+
+    client_id = int(parts[3])
+
+    # Получаем информацию о клиенте
+    async with db_pool.acquire() as conn:
+        client = await conn.fetchrow(
+            "SELECT * FROM clients WHERE client_id = $1",
+            client_id
+        )
+
+    if not client:
+        await q.message.edit_text("❌ Клієнта не знайдено.", reply_markup=kb_clients_menu())
+        await q.answer()
+        return
+
+    client = dict(client)
+    stats = await get_client_statistics(client_id)
+
+    # Формируем текст с информацией
+    text = f"👤 Профіль клієнта\n\n"
+    text += f"📝 ПІБ: {client.get('full_name', '—')}\n"
+    text += f"📞 Телефон: {client.get('phone', '—')}\n"
+    text += f"🆔 Telegram ID: {client.get('tg_user_id', '—')}\n"
+    text += f"📅 Реєстрація: {fmt_date(client['created_at']) if client.get('created_at') else '—'}\n"
+    text += f"👁 Остання активність: {fmt_date(client['last_seen_at']) if client.get('last_seen_at') else '—'}\n\n"
+
+    text += f"📊 Статистика:\n"
+    text += f"• Відвідано конференцій: {stats['attended_count']}\n"
+    text += f"• Підтверджено майбутніх: {stats['confirmed_count']}\n"
+    text += f"• Пройдено типів: {stats['completed_types']}/{stats['total_types']}\n\n"
+
+    # Типы конференций
+    if stats['attended_types']:
+        text += f"✅ Пройдені типи конференцій:\n"
+        for at in stats['attended_types']:
+            text += f"  • {at['title']}\n"
+        text += "\n"
+
+    # Посещенные события
+    if stats['attended_events']:
+        text += f"📋 Відвідані конференції (останні 5):\n"
+        for i, ev in enumerate(stats['attended_events'][:5], 1):
+            dt_str = fmt_date(ev['start_at']) if ev.get('start_at') else '—'
+            text += f"{i}. {ev['title']} ({dt_str})\n"
+        if len(stats['attended_events']) > 5:
+            text += f"   ...та ще {len(stats['attended_events']) - 5}\n"
+        text += "\n"
+
+    # Будущие подтвержденные события
+    if stats['confirmed_events']:
+        text += f"🔜 Підтверджені майбутні конференції:\n"
+        for ev in stats['confirmed_events']:
+            dt_str = fmt_date(ev['start_at']) if ev.get('start_at') else '—'
+            text += f"  • {ev['title']} ({dt_str})\n"
+
+    await q.message.edit_text(text, reply_markup=kb_client_detail(client_id))
+    await q.answer()
+
 # ---------- RSVP ----------
 
 @dp.callback_query(F.data.startswith("rsvp:"))
@@ -1131,6 +1424,17 @@ async def cb_rsvp(q: CallbackQuery):
         return
 
     if action == "going":
+        # Проверяем, нет ли конфликта времени с другими подтвержденными конференциями
+        dt = event_start_dt(event)
+        duration = event.get("duration_min", 60)
+        if dt and await client_has_confirmed_event_at_time(client_id, dt, duration):
+            await safe_edit_message(
+                q.message,
+                q.message.text + "\n\n⚠️ У Вас вже є підтверджена конференція на цей час. Не можна підтвердити участь у двох конференціях одночасно."
+            )
+            await q.answer("Конфлікт часу")
+            return
+
         await rsvp_upsert(event_id, client_id, rsvp="going")
         await mark_attendance(event_id, client_id, True)
         await log_action("rsvp_yes", client_id=client_id, event_id=event_id, details="")
@@ -1211,6 +1515,16 @@ async def alt_pick(q: CallbackQuery):
     if not alt_event:
         await q.message.edit_text("На жаль, обрану дату не знайдено.")
         await q.answer()
+        return
+
+    # Проверяем конфликт времени
+    dt = event_start_dt(alt_event)
+    duration = alt_event.get("duration_min", 60)
+    if dt and await client_has_confirmed_event_at_time(client_id, dt, duration):
+        await q.message.edit_text(
+            "⚠️ У Вас вже є підтверджена конференція на цей час. Будь ласка, оберіть іншу дату або скасуйте попередню конференцію."
+        )
+        await q.answer("Конфлікт часу")
         return
 
     await rsvp_upsert(alt_event_id, client_id, rsvp="going")
@@ -1392,7 +1706,12 @@ async def notify_event_cancel(event_id: int):
                     pass
 
 async def send_initial_invites_for_event(event: Dict[str, Any]):
-    """Рассылка начальных приглашений на событие"""
+    """Рассылка начальных приглашений на событие
+
+    Специальные правила:
+    - type_code 4 (ДОКУМЕНТИ ЗБИРАЄМО РАЗОМ) отправляется только тем,
+      кто уже посетил type_code 1 (Конференція зі збору документів для суду)
+    """
     event_id = event.get("event_id")
     dt = event_start_dt(event)
     if not dt:
@@ -1428,6 +1747,19 @@ async def send_initial_invites_for_event(event: Dict[str, Any]):
         if await client_has_active_invite_for_type(cid, type_code):
             skip_reasons["has_active_invite"] = skip_reasons.get("has_active_invite", 0) + 1
             await log_action("invite_skip", client_id=cid, event_id=event_id, details=f"has_active_invite type={type_code}")
+            continue
+
+        # Специальная проверка: type_code 4 только для тех, кто посетил type_code 1
+        if type_code == 4:
+            if not await client_has_attended_type(cid, 1):
+                skip_reasons["type4_requires_type1"] = skip_reasons.get("type4_requires_type1", 0) + 1
+                await log_action("invite_skip", client_id=cid, event_id=event_id, details=f"type4 requires type1 attendance")
+                continue
+
+        # Проверка на пересечение времени с другими подтвержденными конференциями
+        if await client_has_confirmed_event_at_time(cid, dt, event.get("duration_min", 60)):
+            skip_reasons["time_conflict"] = skip_reasons.get("time_conflict", 0) + 1
+            await log_action("invite_skip", client_id=cid, event_id=event_id, details=f"time_conflict at {iso_dt(dt)}")
             continue
 
         if await has_log("invite_sent", cid, event_id):
@@ -1472,16 +1804,16 @@ async def scheduler_tick():
         now = now_kyiv()
 
         # ДЛЯ ТЕСТИРОВАНИЯ: уменьшенные интервалы
-        # REM_24H = 2*60      # 2 минуты вместо 24 часов (напоминание за "24ч")
-        # REM_60M = 1*60      # 1 минута вместо 1 часа (напоминание за "1ч")
-        # FEEDBACK_DELAY = 1*60   # 1 минута после окончания
-        # JITTER = 30             # 30 секунд для точности срабатывания
+        REM_24H = 2*60      # 2 минуты вместо 24 часов (напоминание за "24ч")
+        REM_60M = 1*60      # 1 минута вместо 1 часа (напоминание за "1ч")
+        FEEDBACK_DELAY = 1*60   # 1 минута после окончания
+        JITTER = 30             # 30 секунд для точности срабатывания
 
         # ДЛЯ ПРОДАКШЕНА раскомментируй:
-        REM_24H = 24*3600
-        REM_60M = 60*60
-        FEEDBACK_DELAY = 5*60
-        JITTER = 60
+        # REM_24H = 24*3600
+        # REM_60M = 60*60
+        # FEEDBACK_DELAY = 5*60
+        # JITTER = 60
 
         for e in await list_future_events_sorted():
             dt = event_start_dt(e)
