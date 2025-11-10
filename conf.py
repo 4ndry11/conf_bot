@@ -369,14 +369,49 @@ async def list_alternative_events_same_type(type_code: int, exclude_event_id: in
 async def mark_attendance(event_id: int, client_id: int, attended: bool = True) -> None:
     """Отметка посещения"""
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO attendance (event_id, client_id, attended, marked_at)
-               VALUES ($1, $2, $3, $4)
-               ON CONFLICT (event_id, client_id)
-               DO UPDATE SET attended = EXCLUDED.attended, marked_at = EXCLUDED.marked_at""",
-            event_id, client_id, attended, now_kyiv()
-        )
-        await log_action("attendance_marked", client_id=client_id, event_id=event_id, details=f"attended={attended}")
+        # Проверяем, был ли это повторный визит
+        event = await conn.fetchrow("SELECT type FROM events WHERE event_id = $1", event_id)
+        if event:
+            type_code = event['type']
+            was_repeat = await client_needs_repeat_for_type(client_id, type_code)
+
+            # Вставляем/обновляем запись о посещении
+            await conn.execute(
+                """INSERT INTO attendance (event_id, client_id, attended, marked_at)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (event_id, client_id)
+                   DO UPDATE SET attended = EXCLUDED.attended, marked_at = EXCLUDED.marked_at""",
+                event_id, client_id, attended, now_kyiv()
+            )
+
+            # Если клиент посетил и это был повторный запрос - сбрасываем флаг needs_repeat у предыдущих записей
+            if attended and was_repeat:
+                await conn.execute(
+                    """UPDATE attendance a
+                       SET needs_repeat = FALSE
+                       FROM events e
+                       WHERE a.event_id = e.event_id
+                         AND a.client_id = $1
+                         AND e.type = $2
+                         AND a.needs_repeat = TRUE
+                         AND a.event_id != $3""",
+                    client_id, type_code, event_id
+                )
+                await log_action("attendance_marked", client_id=client_id, event_id=event_id,
+                               details=f"attended={attended}, repeat_fulfilled=true")
+            else:
+                await log_action("attendance_marked", client_id=client_id, event_id=event_id,
+                               details=f"attended={attended}")
+        else:
+            # Если событие не найдено - просто отмечаем посещение
+            await conn.execute(
+                """INSERT INTO attendance (event_id, client_id, attended, marked_at)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (event_id, client_id)
+                   DO UPDATE SET attended = EXCLUDED.attended, marked_at = EXCLUDED.marked_at""",
+                event_id, client_id, attended, now_kyiv()
+            )
+            await log_action("attendance_marked", client_id=client_id, event_id=event_id, details=f"attended={attended}")
 
 async def attendance_clear_for_event(event_id: int, mode: str = "zero") -> int:
     """Очистка записей о посещении для события"""
@@ -392,6 +427,20 @@ async def attendance_clear_for_event(event_id: int, mode: str = "zero") -> int:
         touched = int(result.split()[-1]) if result else 0
         await log_action("attendance_cleared_on_cancel", event_id=event_id, details=f"mode={mode}; rows={touched}")
         return touched
+
+async def client_needs_repeat_for_type(client_id: int, type_code: int) -> bool:
+    """Проверка, запросил ли клиент повторное посещение конференции данного типа"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT a.needs_repeat
+               FROM attendance a
+               JOIN events e ON a.event_id = e.event_id
+               WHERE a.client_id = $1 AND e.type = $2 AND a.attended = TRUE AND a.needs_repeat = TRUE
+               ORDER BY e.start_at DESC
+               LIMIT 1""",
+            client_id, type_code
+        )
+        return bool(row and row['needs_repeat'])
 
 async def client_has_attended_type(client_id: int, type_code: int) -> bool:
     """Проверка, посещал ли клиент событие данного типа"""
@@ -597,10 +646,33 @@ async def get_event_statistics(event_id: int) -> Dict[str, Any]:
             for row in confirmed
         ]
 
+        # Клиенты, которые запросили повтор для этого типа конференции
+        event = await conn.fetchrow("SELECT type FROM events WHERE event_id = $1", event_id)
+        repeat_clients = []
+        if event:
+            type_code = event['type']
+            repeat_rows = await conn.fetch(
+                """SELECT DISTINCT c.client_id, c.full_name, c.phone
+                   FROM attendance a
+                   JOIN events e ON a.event_id = e.event_id
+                   JOIN clients c ON a.client_id = c.client_id
+                   WHERE e.type = $1 AND a.needs_repeat = TRUE AND a.attended = TRUE""",
+                type_code
+            )
+            repeat_clients = [
+                {
+                    "client_id": row['client_id'],
+                    "full_name": row['full_name'] or "—",
+                    "phone": row['phone'] or "—"
+                }
+                for row in repeat_rows
+            ]
+
         return {
             "invitations_sent": invitations_sent or 0,
             "confirmed_count": len(confirmed_clients),
-            "confirmed_clients": confirmed_clients
+            "confirmed_clients": confirmed_clients,
+            "repeat_clients": repeat_clients
         }
 
 async def build_types_overview_text(cli: Dict[str, Any]) -> str:
@@ -674,6 +746,16 @@ async def get_client_statistics(client_id: int) -> Dict[str, Any]:
         # Все типы конференций
         all_types = await get_eventtypes_active()
 
+        # Типы конференций, для которых запрошен повтор
+        repeat_types = await conn.fetch(
+            """SELECT DISTINCT e.type, et.title
+               FROM attendance a
+               JOIN events e ON a.event_id = e.event_id
+               JOIN event_types et ON e.type = et.type_code
+               WHERE a.client_id = $1 AND a.needs_repeat = TRUE AND a.attended = TRUE""",
+            client_id
+        )
+
         return {
             "attended_count": attended_count or 0,
             "attended_events": [dict(row) for row in attended_events],
@@ -681,7 +763,8 @@ async def get_client_statistics(client_id: int) -> Dict[str, Any]:
             "confirmed_events": [dict(row) for row in confirmed_events],
             "attended_types": [dict(row) for row in attended_types],
             "total_types": len(all_types),
-            "completed_types": len(attended_types)
+            "completed_types": len(attended_types),
+            "repeat_types": [dict(row) for row in repeat_types]
         }
 
 async def list_clients_by_filter(filter_type: str = "all") -> List[Dict[str, Any]]:
@@ -812,8 +895,15 @@ def kb_clients_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:home")],
     ])
 
-def kb_client_detail(client_id: int) -> InlineKeyboardMarkup:
+def kb_client_detail(client_id: int, status: str = "active") -> InlineKeyboardMarkup:
+    # Кнопка блокировки/разблокировки
+    if status == "active":
+        toggle_btn = InlineKeyboardButton(text="🚫 Заблокувати від розсилок", callback_data=f"admin:client:block:{client_id}")
+    else:
+        toggle_btn = InlineKeyboardButton(text="✅ Розблокувати розсилки", callback_data=f"admin:client:unblock:{client_id}")
+
     return InlineKeyboardMarkup(inline_keyboard=[
+        [toggle_btn],
         [InlineKeyboardButton(text="⬅️ Назад до списку", callback_data="admin:clients:menu")],
     ])
 
@@ -1151,12 +1241,21 @@ async def admin_info(q: CallbackQuery):
         f"• Підтвердили участь: {stats['confirmed_count']}\n"
     )
 
+    if stats.get('repeat_clients'):
+        text += f"• 🔄 Запросили повтор: {len(stats['repeat_clients'])}\n"
+
     if stats['confirmed_clients']:
         text += f"\n✅ Підтвердили участь:\n"
         for i, cli in enumerate(stats['confirmed_clients'], 1):
             text += f"{i}. {cli['full_name']} ({cli['phone']})\n"
     else:
         text += f"\n⚠️ Ще ніхто не підтвердив участь\n"
+
+    # Показываем клиентов, которые запросили повтор
+    if stats.get('repeat_clients'):
+        text += f"\n🔄 Запросили повторне відвідування:\n"
+        for i, cli in enumerate(stats['repeat_clients'], 1):
+            text += f"{i}. {cli['full_name']} ({cli['phone']})\n"
 
     await q.message.edit_text(text, reply_markup=kb_event_info(event_id))
     await q.answer()
@@ -1350,17 +1449,29 @@ async def admin_client_view(q: CallbackQuery):
     stats = await get_client_statistics(client_id)
 
     # Формируем текст с информацией
+    client_status = client.get('status', 'active')
+    status_emoji = "🚫" if client_status == "blocked" else "✅"
+    status_text = "ЗАБЛОКОВАНИЙ" if client_status == "blocked" else "Активний"
+
     text = f"👤 Профіль клієнта\n\n"
     text += f"📝 ПІБ: {client.get('full_name', '—')}\n"
     text += f"📞 Телефон: {client.get('phone', '—')}\n"
     text += f"🆔 Telegram ID: {client.get('tg_user_id', '—')}\n"
+    text += f"{status_emoji} Статус розсилок: {status_text}\n"
     text += f"📅 Реєстрація: {fmt_date(client['created_at']) if client.get('created_at') else '—'}\n"
     text += f"👁 Остання активність: {fmt_date(client['last_seen_at']) if client.get('last_seen_at') else '—'}\n\n"
 
     text += f"📊 Статистика:\n"
     text += f"• Відвідано конференцій: {stats['attended_count']}\n"
     text += f"• Підтверджено майбутніх: {stats['confirmed_count']}\n"
-    text += f"• Пройдено типів: {stats['completed_types']}/{stats['total_types']}\n\n"
+    text += f"• Пройдено типів: {stats['completed_types']}/{stats['total_types']}\n"
+
+    # Информация о повторных посещениях
+    if stats.get('repeat_types'):
+        repeat_titles = [rt['title'] for rt in stats['repeat_types']]
+        text += f"• 🔄 Повторні відвідування: {len(repeat_titles)} ({', '.join(repeat_titles)})\n"
+
+    text += "\n"
 
     # Типы конференций
     if stats['attended_types']:
@@ -1386,8 +1497,158 @@ async def admin_client_view(q: CallbackQuery):
             dt_str = fmt_date(ev['start_at']) if ev.get('start_at') else '—'
             text += f"  • {ev['title']} ({dt_str})\n"
 
-    await q.message.edit_text(text, reply_markup=kb_client_detail(client_id))
+    await q.message.edit_text(text, reply_markup=kb_client_detail(client_id, client_status))
     await q.answer()
+
+@dp.callback_query(F.data.startswith("admin:client:block:"))
+async def admin_client_block(q: CallbackQuery):
+    """Блокировка клиента от рассылок"""
+    if q.from_user.id not in ADMINS:
+        await q.answer()
+        return
+
+    parts = q.data.split(":")
+    if len(parts) != 4:
+        await q.answer()
+        return
+
+    client_id = int(parts[3])
+
+    # Обновляем статус клиента
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE clients SET status = 'blocked' WHERE client_id = $1",
+            client_id
+        )
+
+    await log_action("client_blocked", client_id=client_id, details=f"by_admin:{q.from_user.id}")
+    await q.answer("✅ Клієнта заблоковано від розсилок")
+
+    # Обновляем экран клиента
+    async with db_pool.acquire() as conn:
+        client = await conn.fetchrow(
+            "SELECT * FROM clients WHERE client_id = $1",
+            client_id
+        )
+
+    if client:
+        client = dict(client)
+        stats = await get_client_statistics(client_id)
+
+        client_status = client.get('status', 'active')
+        status_emoji = "🚫" if client_status == "blocked" else "✅"
+        status_text = "ЗАБЛОКОВАНИЙ" if client_status == "blocked" else "Активний"
+
+        text = f"👤 Профіль клієнта\n\n"
+        text += f"📝 ПІБ: {client.get('full_name', '—')}\n"
+        text += f"📞 Телефон: {client.get('phone', '—')}\n"
+        text += f"🆔 Telegram ID: {client.get('tg_user_id', '—')}\n"
+        text += f"{status_emoji} Статус розсилок: {status_text}\n"
+        text += f"📅 Реєстрація: {fmt_date(client['created_at']) if client.get('created_at') else '—'}\n"
+        text += f"👁 Остання активність: {fmt_date(client['last_seen_at']) if client.get('last_seen_at') else '—'}\n\n"
+
+        text += f"📊 Статистика:\n"
+        text += f"• Відвідано конференцій: {stats['attended_count']}\n"
+        text += f"• Підтверджено майбутніх: {stats['confirmed_count']}\n"
+        text += f"• Пройдено типів: {stats['completed_types']}/{stats['total_types']}\n\n"
+
+        if stats['attended_types']:
+            text += f"✅ Пройдені типи конференцій:\n"
+            for at in stats['attended_types']:
+                text += f"  • {at['title']}\n"
+            text += "\n"
+
+        if stats['attended_events']:
+            text += f"📋 Відвідані конференції (останні 5):\n"
+            for i, ev in enumerate(stats['attended_events'][:5], 1):
+                dt_str = fmt_date(ev['start_at']) if ev.get('start_at') else '—'
+                text += f"{i}. {ev['title']} ({dt_str})\n"
+            if len(stats['attended_events']) > 5:
+                text += f"   ...та ще {len(stats['attended_events']) - 5}\n"
+            text += "\n"
+
+        if stats['confirmed_events']:
+            text += f"🔜 Підтверджені майбутні конференції:\n"
+            for ev in stats['confirmed_events']:
+                dt_str = fmt_date(ev['start_at']) if ev.get('start_at') else '—'
+                text += f"  • {ev['title']} ({dt_str})\n"
+
+        await q.message.edit_text(text, reply_markup=kb_client_detail(client_id, client_status))
+
+@dp.callback_query(F.data.startswith("admin:client:unblock:"))
+async def admin_client_unblock(q: CallbackQuery):
+    """Разблокировка клиента для рассылок"""
+    if q.from_user.id not in ADMINS:
+        await q.answer()
+        return
+
+    parts = q.data.split(":")
+    if len(parts) != 4:
+        await q.answer()
+        return
+
+    client_id = int(parts[3])
+
+    # Обновляем статус клиента
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE clients SET status = 'active' WHERE client_id = $1",
+            client_id
+        )
+
+    await log_action("client_unblocked", client_id=client_id, details=f"by_admin:{q.from_user.id}")
+    await q.answer("✅ Клієнта розблоковано для розсилок")
+
+    # Обновляем экран клиента
+    async with db_pool.acquire() as conn:
+        client = await conn.fetchrow(
+            "SELECT * FROM clients WHERE client_id = $1",
+            client_id
+        )
+
+    if client:
+        client = dict(client)
+        stats = await get_client_statistics(client_id)
+
+        client_status = client.get('status', 'active')
+        status_emoji = "🚫" if client_status == "blocked" else "✅"
+        status_text = "ЗАБЛОКОВАНИЙ" if client_status == "blocked" else "Активний"
+
+        text = f"👤 Профіль клієнта\n\n"
+        text += f"📝 ПІБ: {client.get('full_name', '—')}\n"
+        text += f"📞 Телефон: {client.get('phone', '—')}\n"
+        text += f"🆔 Telegram ID: {client.get('tg_user_id', '—')}\n"
+        text += f"{status_emoji} Статус розсилок: {status_text}\n"
+        text += f"📅 Реєстрація: {fmt_date(client['created_at']) if client.get('created_at') else '—'}\n"
+        text += f"👁 Остання активність: {fmt_date(client['last_seen_at']) if client.get('last_seen_at') else '—'}\n\n"
+
+        text += f"📊 Статистика:\n"
+        text += f"• Відвідано конференцій: {stats['attended_count']}\n"
+        text += f"• Підтверджено майбутніх: {stats['confirmed_count']}\n"
+        text += f"• Пройдено типів: {stats['completed_types']}/{stats['total_types']}\n\n"
+
+        if stats['attended_types']:
+            text += f"✅ Пройдені типи конференцій:\n"
+            for at in stats['attended_types']:
+                text += f"  • {at['title']}\n"
+            text += "\n"
+
+        if stats['attended_events']:
+            text += f"📋 Відвідані конференції (останні 5):\n"
+            for i, ev in enumerate(stats['attended_events'][:5], 1):
+                dt_str = fmt_date(ev['start_at']) if ev.get('start_at') else '—'
+                text += f"{i}. {ev['title']} ({dt_str})\n"
+            if len(stats['attended_events']) > 5:
+                text += f"   ...та ще {len(stats['attended_events']) - 5}\n"
+            text += "\n"
+
+        if stats['confirmed_events']:
+            text += f"🔜 Підтверджені майбутні конференції:\n"
+            for ev in stats['confirmed_events']:
+                dt_str = fmt_date(ev['start_at']) if ev.get('start_at') else '—'
+                text += f"  • {ev['title']} ({dt_str})\n"
+
+        await q.message.edit_text(text, reply_markup=kb_client_detail(client_id, client_status))
 
 # ---------- RSVP ----------
 
@@ -1624,11 +1885,20 @@ async def fb_callbacks(q: CallbackQuery, state: FSMContext):
             except Exception as e:
                 await log_action("support_send_error", client_id=client_id, event_id=event_id, details=f"{e!r}")
 
-        prompt = f"Дякуємо! Вашу оцінку {stars}⭐️ збережено.\nБажаєте додати коментар?"
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✍️ Написати коментар", callback_data=f"fb:comment:{event_id}:{client_id}")],
-            [InlineKeyboardButton(text="⏭ Пропустити", callback_data=f"fb:skip:{event_id}:{client_id}")]
-        ])
+        # Для оценок 1-3 спрашиваем о повторном посещении
+        if stars <= 3:
+            prompt = f"Дякуємо за оцінку! {stars}⭐️\n\nМожливо, щось було незрозуміло?\nБажаєте відвідати цю конференцію повторно?"
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Хочу відвідати повторно", callback_data=f"repeat:{event_id}:{client_id}:yes")],
+                [InlineKeyboardButton(text="✅ Все зрозуміло, повтор не потрібен", callback_data=f"repeat:{event_id}:{client_id}:no")]
+            ])
+        else:
+            # Для оценок 4-5 обычный флоу с комментарием
+            prompt = f"Дякуємо! Вашу оцінку {stars}⭐️ збережено.\nБажаєте додати коментар?"
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✍️ Написати коментар", callback_data=f"fb:comment:{event_id}:{client_id}")],
+                [InlineKeyboardButton(text="⏭ Пропустити", callback_data=f"fb:skip:{event_id}:{client_id}")]
+            ])
         await q.message.edit_text(prompt, reply_markup=kb)
         await q.answer()
         return
@@ -1673,6 +1943,77 @@ async def fb_wait_comment(m: Message, state: FSMContext):
     if stars and stars < 4 and comment:
         await route_low_feedback_comment_update(event_id, client_id, comment)
 
+# ---------- REPEAT REQUEST ----------
+
+@dp.callback_query(F.data.startswith("repeat:"))
+async def repeat_request_handler(q: CallbackQuery):
+    """Обработчик запроса на повторное посещение конференции"""
+    parts = q.data.split(":")
+    if len(parts) != 4:
+        await q.answer()
+        return
+
+    event_id = int(parts[1])
+    client_id = int(parts[2])
+    response = parts[3]  # "yes" или "no"
+
+    if response == "yes":
+        # Клиент хочет повторно посетить - устанавливаем флаг needs_repeat
+        async with db_pool.acquire() as conn:
+            # Получаем тип конференции
+            event = await conn.fetchrow("SELECT type FROM events WHERE event_id = $1", event_id)
+            if not event:
+                await q.message.edit_text("❌ Подію не знайдено.")
+                await q.answer()
+                return
+
+            type_code = event['type']
+
+            # Устанавливаем флаг needs_repeat для последнего посещения этого типа
+            await conn.execute(
+                """UPDATE attendance
+                   SET needs_repeat = TRUE
+                   WHERE client_id = $1 AND event_id = $2""",
+                client_id, event_id
+            )
+
+            await log_action("repeat_requested", client_id=client_id, event_id=event_id,
+                           details=f"type={type_code}")
+
+        await q.message.edit_text(
+            "✅ Дякуємо! Ми відправимо Вам запрошення на наступну конференцію цього типу.\n\n"
+            "Бажаєте додати коментар до оцінки?"
+        )
+        # Предлагаем оставить комментарий
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✍️ Написати коментар", callback_data=f"fb:comment:{event_id}:{client_id}")],
+            [InlineKeyboardButton(text="⏭ Пропустити", callback_data=f"fb:skip:{event_id}:{client_id}")]
+        ])
+        await q.message.edit_text(
+            "✅ Дякуємо! Ми відправимо Вам запрошення на наступну конференцію цього типу.\n\n"
+            "Бажаєте додати коментар до оцінки?",
+            reply_markup=kb
+        )
+        await q.answer("Запит на повторне відвідування збережено")
+
+    else:  # response == "no"
+        # Клиент не хочет повторно - просто благодарим
+        await q.message.edit_text(
+            "✅ Дякуємо за Ваш відгук!\n\n"
+            "Бажаєте додати коментар до оцінки?"
+        )
+        # Предлагаем оставить комментарий
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✍️ Написати коментар", callback_data=f"fb:comment:{event_id}:{client_id}")],
+            [InlineKeyboardButton(text="⏭ Пропустити", callback_data=f"fb:skip:{event_id}:{client_id}")]
+        ])
+        await q.message.edit_text(
+            "✅ Дякуємо за Ваш відгук!\n\n"
+            "Бажаєте додати коментар до оцінки?",
+            reply_markup=kb
+        )
+        await q.answer()
+
 # =============================== NOTIFY HELPERS ================================
 
 async def notify_event_update(event_id: int, what: str):
@@ -1685,6 +2026,10 @@ async def notify_event_update(event_id: int, what: str):
         if str(r.get("rsvp")) == "going":
             tg_id = await try_get_tg_from_client_id(r.get("client_id"))
             if tg_id:
+                # Проверка статуса клиента
+                client = await get_client_by_tg(tg_id)
+                if not client or client.get('status') != 'active':
+                    continue
                 try:
                     await bot.send_message(chat_id=int(tg_id), text=body)
                 except Exception:
@@ -1700,6 +2045,10 @@ async def notify_event_cancel(event_id: int):
         if str(r.get("rsvp")) == "going":
             tg_id = await try_get_tg_from_client_id(r.get("client_id"))
             if tg_id:
+                # Проверка статуса клиента
+                client = await get_client_by_tg(tg_id)
+                if not client or client.get('status') != 'active':
+                    continue
                 try:
                     await bot.send_message(chat_id=int(tg_id), text=body)
                 except Exception:
@@ -1739,10 +2088,19 @@ async def send_initial_invites_for_event(event: Dict[str, Any]):
             await log_action("invite_skip", client_id=cid, event_id=event_id, details=f"no_cid_or_tg")
             continue
 
-        if await client_has_attended_type(cid, type_code):
+        # Проверяем, посещал ли клиент этот тип конференции
+        has_attended = await client_has_attended_type(cid, type_code)
+        needs_repeat = await client_needs_repeat_for_type(cid, type_code)
+
+        # Пропускаем только если уже посещал И НЕ запросил повтор
+        if has_attended and not needs_repeat:
             skip_reasons["already_attended"] = skip_reasons.get("already_attended", 0) + 1
             await log_action("invite_skip", client_id=cid, event_id=event_id, details=f"already_attended type={type_code}")
             continue
+
+        # Если клиент запросил повтор - отмечаем это в логе
+        if needs_repeat:
+            await log_action("invite_repeat", client_id=cid, event_id=event_id, details=f"repeat_request type={type_code}")
 
         if await client_has_active_invite_for_type(cid, type_code):
             skip_reasons["has_active_invite"] = skip_reasons.get("has_active_invite", 0) + 1
@@ -1829,6 +2187,10 @@ async def scheduler_tick():
                     tg_id = await try_get_tg_from_client_id(cid)
                     if not tg_id:
                         continue
+                    # Проверка статуса клиента
+                    client = await get_client_by_tg(tg_id)
+                    if not client or client.get('status') != 'active':
+                        continue
                     if r.get("reminded_24h"):
                         continue
                     if str(r.get("rsvp")) == "going":
@@ -1848,6 +2210,10 @@ async def scheduler_tick():
                     cid = r.get("client_id")
                     tg_id = await try_get_tg_from_client_id(cid)
                     if not tg_id:
+                        continue
+                    # Проверка статуса клиента
+                    client = await get_client_by_tg(tg_id)
+                    if not client or client.get('status') != 'active':
                         continue
                     if r.get("reminded_60m"):
                         continue
@@ -1877,6 +2243,10 @@ async def scheduler_tick():
                         cid = r.get("client_id")
                         tg_id = await try_get_tg_from_client_id(cid)
                         if not tg_id:
+                            continue
+                        # Проверка статуса клиента
+                        client = await get_client_by_tg(tg_id)
+                        if not client or client.get('status') != 'active':
                             continue
                         text = (await messages_get("feedback.ask")).format(title=e["title"])
                         kb = InlineKeyboardMarkup(inline_keyboard=[[
