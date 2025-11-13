@@ -2113,8 +2113,8 @@ async def scheduler_tick():
         #JITTER = 30             # 30 секунд для точности срабатывания
 
         # ДЛЯ ПРОДАКШЕНА раскомментируй:
-        REM_24H = 24*3600
-        REM_60M = 60*60
+        REM_24H = 60*60
+        REM_60M = 10*60
         FEEDBACK_DELAY = 5*60
         JITTER = 60
 
