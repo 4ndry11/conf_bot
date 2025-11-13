@@ -2113,8 +2113,8 @@ async def scheduler_tick():
         #JITTER = 30             # 30 секунд для точности срабатывания
 
         # ДЛЯ ПРОДАКШЕНА раскомментируй:
-        REM_24H = 60*60
-        REM_60M = 10*60
+        REM_24H = 60*60        # Напоминание за 1 час
+        REM_60M = 10*60        # Напоминание за 10 минут
         FEEDBACK_DELAY = 5*60
         JITTER = 60
 
@@ -2178,6 +2178,9 @@ async def scheduler_tick():
                 if await has_log("feedback_requested", 0, e["event_id"]):
                     continue
 
+                # СРАЗУ логируем ДО отправки, чтобы избежать дублей
+                await log_action("feedback_requested", event_id=e["event_id"], details=f"delay={FEEDBACK_DELAY}")
+
                 async with db_pool.acquire() as conn:
                     rows_att = await conn.fetch(
                         "SELECT * FROM attendance WHERE event_id = $1 AND attended = TRUE",
@@ -2205,8 +2208,6 @@ async def scheduler_tick():
                             await bot.send_message(chat_id=int(tg_id), text=text, reply_markup=kb)
                         except Exception:
                             pass
-
-                await log_action("feedback_requested", event_id=e["event_id"], details=f"delay={FEEDBACK_DELAY}")
 
     except Exception as e:
         import traceback
