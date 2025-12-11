@@ -428,6 +428,22 @@ async def count_client_attendance_for_type(client_id: int, type_code: int) -> in
         )
         return row['count'] if row else 0
 
+async def count_client_confirmed_today_by_type(client_id: int, type_code: int) -> int:
+    """Подсчет количества подтвержденных событий (rsvp='going') СЕГОДНЯ для данного type_code"""
+    today_start = now_kyiv().replace(hour=0, minute=0, second=0, microsecond=0)
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT COUNT(*) as count
+               FROM rsvp r
+               JOIN events e ON r.event_id = e.event_id
+               WHERE r.client_id = $1
+                 AND e.type = $2
+                 AND r.rsvp = 'going'
+                 AND r.rsvp_at >= $3""",
+            client_id, type_code, today_start
+        )
+        return row['count'] if row else 0
+
 async def get_client_by_id(client_id: int) -> Optional[Dict[str, Any]]:
     """Получение клиента по client_id"""
     async with db_pool.acquire() as conn:
@@ -1686,7 +1702,6 @@ async def cb_rsvp(q: CallbackQuery):
             return
 
         await rsvp_upsert(event_id, client_id, rsvp="going")
-        await mark_attendance(event_id, client_id, True)
         await log_action("rsvp_yes", client_id=client_id, event_id=event_id, details="")
 
         # Сохраняем исходное сообщение и добавляем подтверждение
@@ -1778,7 +1793,6 @@ async def alt_pick(q: CallbackQuery):
         return
 
     await rsvp_upsert(alt_event_id, client_id, rsvp="going")
-    await mark_attendance(alt_event_id, client_id, True)
     await log_action("rsvp_alt_yes", client_id=client_id, event_id=alt_event_id, details="picked_alternative")
 
     dt = event_start_dt(alt_event)
@@ -1793,6 +1807,65 @@ async def alt_pick(q: CallbackQuery):
 
 @dp.callback_query(F.data == "noop")
 async def noop(q: CallbackQuery):
+    await q.answer()
+
+# ---------- POST-EVENT SURVEY (опрос "Удалось ли присоединиться?") ----------
+
+@dp.callback_query(F.data.startswith("post_survey:"))
+async def handle_post_event_survey(q: CallbackQuery):
+    """Обработка ответа на опрос после конференции"""
+    parts = q.data.split(":")
+    if len(parts) < 4:
+        await q.answer("Помилка")
+        return
+
+    action = parts[1]  # "yes" или "no"
+    event_id = int(parts[2])
+    client_id = int(parts[3])
+
+    # Проверяем, что это тот же пользователь
+    client = await get_client_by_id(client_id)
+    if not client or client.get('tg_user_id') != q.from_user.id:
+        await q.answer("Помилка: невідповідність користувача")
+        return
+
+    event = await get_event_by_id(event_id)
+    if not event:
+        await q.answer("Подія не знайдена")
+        return
+
+    if action == "yes":
+        # Клиент был на конференции - отмечаем посещение
+        await mark_attendance(event_id, client_id, True)
+        await q.message.edit_text("Дякуємо! ✅")
+        await log_action("post_event_survey_response", client_id=client_id, event_id=event_id, details="attended=yes")
+
+        # Отправляем опрос с оценкой
+        tg_id = client.get('tg_user_id')
+        if tg_id:
+            text = f"Будь ласка, оцініть конференцію «{event['title']}»:"
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⭐️1", callback_data=f"fb:{event_id}:{client_id}:1"),
+                InlineKeyboardButton(text="⭐️2", callback_data=f"fb:{event_id}:{client_id}:2"),
+                InlineKeyboardButton(text="⭐️3", callback_data=f"fb:{event_id}:{client_id}:3"),
+                InlineKeyboardButton(text="⭐️4", callback_data=f"fb:{event_id}:{client_id}:4"),
+                InlineKeyboardButton(text="⭐️5", callback_data=f"fb:{event_id}:{client_id}:5"),
+            ]])
+            try:
+                await bot.send_message(chat_id=int(tg_id), text=text, reply_markup=kb)
+                await log_action("feedback_requested_after_survey", client_id=client_id, event_id=event_id)
+            except Exception:
+                pass
+    else:
+        # Клиент не был - оставляем attended=FALSE
+        await mark_attendance(event_id, client_id, False)
+        await q.message.edit_text(
+            "Дякуємо за відповідь! 🙏\n\n"
+            "Нічого страшного! Ви отримаєте нове запрошення, коли наступна конференція цього типу буде заплановано.\n\n"
+            "Ми завжди раді бачити вас! 💙💛"
+        )
+        await log_action("post_event_survey_response", client_id=client_id, event_id=event_id, details="attended=no")
+
     await q.answer()
 
 # ---------- DOCUMENTS SURVEY (опрос о сборе документов) ----------
@@ -2059,6 +2132,23 @@ async def send_initial_invites_for_event(event: Dict[str, Any]):
                 await log_action("invite_skip", client_id=cid, event_id=event_id, details=f"documents already collected")
                 continue
 
+        # Проверка лимита подтверждений в день
+        confirmed_today = await count_client_confirmed_today_by_type(cid, type_code)
+        if type_code == 1:
+            # Для type_code=1: максимум 1 подтверждение в день
+            if confirmed_today >= 1:
+                skip_reasons["type1_daily_limit"] = skip_reasons.get("type1_daily_limit", 0) + 1
+                await log_action("invite_skip", client_id=cid, event_id=event_id,
+                                details=f"type1 daily limit reached: {confirmed_today}/1")
+                continue
+        else:
+            # Для остальных: максимум 2 подтверждения в день
+            if confirmed_today >= 2:
+                skip_reasons["daily_limit"] = skip_reasons.get("daily_limit", 0) + 1
+                await log_action("invite_skip", client_id=cid, event_id=event_id,
+                                details=f"daily limit reached: {confirmed_today}/2 for type={type_code}")
+                continue
+
         # Проверка на пересечение времени с другими подтвержденными конференциями
         if await client_has_confirmed_event_at_time(cid, dt, event.get("duration_min", 60)):
             skip_reasons["time_conflict"] = skip_reasons.get("time_conflict", 0) + 1
@@ -2171,23 +2261,32 @@ async def scheduler_tick():
                         except Exception:
                             pass
 
-            # Фидбэк после окончания
+            # Опрос "Удалось присоединиться?" после окончания (кроме type_code 4)
             end_dt = dt + timedelta(minutes=a2i(e.get("duration_min")))
             post_end = (now - end_dt).total_seconds()
             if abs(post_end - FEEDBACK_DELAY) <= JITTER:
-                if await has_log("feedback_requested", 0, e["event_id"]):
+                if await has_log("post_event_survey_requested", 0, e["event_id"]):
                     continue
 
                 # СРАЗУ логируем ДО отправки, чтобы избежать дублей
-                await log_action("feedback_requested", event_id=e["event_id"], details=f"delay={FEEDBACK_DELAY}")
+                await log_action("post_event_survey_requested", event_id=e["event_id"], details=f"delay={FEEDBACK_DELAY}")
 
+                # Для type_code 4 оставляем старую логику (опрос о документах)
+                if e.get("type") == 4:
+                    continue
+
+                # Ищем клиентов с rsvp='going' которым еще не отправляли опрос
                 async with db_pool.acquire() as conn:
-                    rows_att = await conn.fetch(
-                        "SELECT * FROM attendance WHERE event_id = $1 AND attended = TRUE",
+                    rows_rsvp = await conn.fetch(
+                        """SELECT r.client_id, r.event_id
+                           FROM rsvp r
+                           WHERE r.event_id = $1
+                             AND r.rsvp = 'going'
+                             AND (r.post_event_survey_sent IS NULL OR r.post_event_survey_sent = FALSE)""",
                         e["event_id"]
                     )
 
-                    for r in rows_att:
+                    for r in rows_rsvp:
                         cid = r.get("client_id")
                         tg_id = await try_get_tg_from_client_id(cid)
                         if not tg_id:
@@ -2196,16 +2295,26 @@ async def scheduler_tick():
                         client = await get_client_by_tg(tg_id)
                         if not client or client.get('status') != 'active':
                             continue
-                        text = (await messages_get("feedback.ask")).format(title=e["title"])
-                        kb = InlineKeyboardMarkup(inline_keyboard=[[
-                            InlineKeyboardButton(text="⭐️1", callback_data=f"fb:{e['event_id']}:{cid}:1"),
-                            InlineKeyboardButton(text="⭐️2", callback_data=f"fb:{e['event_id']}:{cid}:2"),
-                            InlineKeyboardButton(text="⭐️3", callback_data=f"fb:{e['event_id']}:{cid}:3"),
-                            InlineKeyboardButton(text="⭐️4", callback_data=f"fb:{e['event_id']}:{cid}:4"),
-                            InlineKeyboardButton(text="⭐️5", callback_data=f"fb:{e['event_id']}:{cid}:5"),
-                        ]])
+
+                        text = (
+                            f"Вітаємо! 👋\n\n"
+                            f"Конференція «{e['title']}» завершилася.\n\n"
+                            f"Чи вдалося вам приєднатися?"
+                        )
+                        kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="✅ Так, я був(ла) присутній(я)",
+                                                callback_data=f"post_survey:yes:{e['event_id']}:{cid}")],
+                            [InlineKeyboardButton(text="❌ Ні, не зміг(ла) приєднатися",
+                                                callback_data=f"post_survey:no:{e['event_id']}:{cid}")]
+                        ])
                         try:
                             await bot.send_message(chat_id=int(tg_id), text=text, reply_markup=kb)
+                            # Помечаем что опрос отправлен
+                            await conn.execute(
+                                "UPDATE rsvp SET post_event_survey_sent = TRUE WHERE event_id = $1 AND client_id = $2",
+                                e["event_id"], cid
+                            )
+                            await log_action("post_event_survey_sent", client_id=cid, event_id=e["event_id"])
                         except Exception:
                             pass
 
