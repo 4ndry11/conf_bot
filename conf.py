@@ -910,14 +910,12 @@ async def get_client_full_info(client_id: int) -> Dict[str, Any]:
 async def format_client_info_message(info: Dict[str, Any]) -> str:
     """Форматування повідомлення з інформацією про клієнта"""
     client = info["client"]
-    stats = info["stats"]
     conferences = info["conferences"]
     feedback = info["feedback"]
     invitations = info["invitations"]
 
     # Персональні дані
     status_emoji = "✅ Активний" if client['status'] == 'active' else "❌ Неактивний"
-    docs_emoji = "✅ Так" if client.get('documents_collected') else "❌ Ні"
 
     text = f"""📊 ІНФОРМАЦІЯ ПРО КЛІЄНТА
 
@@ -926,19 +924,20 @@ async def format_client_info_message(info: Dict[str, Any]) -> str:
 • Телефон: {client['phone']}
 • Telegram ID: {client['tg_user_id']}
 • Статус: {status_emoji}
-• Реєстрація: {iso_dt(client['created_at'])}
-• Остання активність: {iso_dt(client['last_seen_at'])}
-• Документи зібрано: {docs_emoji}
+• Реєстрація: {fmt_date(client['created_at'])} {fmt_time(client['created_at'])}
+• Остання активність: {fmt_date(client['last_seen_at'])} {fmt_time(client['last_seen_at'])}
 
 📈 Статистика:
-• Всього відвідано: {stats.get('attended_count', 0)} конференцій
-• Підтверджено (going): {stats.get('confirmed_count', 0)} запрошень
 """
 
-    # Обчислюємо кількість відмов
+    # Рахуємо статистику правильно
+    total_invites = sum(1 for inv in invitations if inv.get('action') == 'invite_sent')
+    attended_count = sum(1 for c in conferences if c.get('attended') == True)
     declined_count = sum(1 for c in conferences if c.get('rsvp') == 'declined')
-    if declined_count > 0:
-        text += f"• Відхилено (declined): {declined_count} запрошень\n"
+
+    text += f"• Всього запрошень: {total_invites}\n"
+    text += f"• Відвідано: {attended_count} конференцій\n"
+    text += f"• Відхилено: {declined_count} запрошень\n"
 
     text += "\n━━━━━━━━━━━━━━━━━━━━━\n\n"
 
