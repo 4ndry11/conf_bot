@@ -121,11 +121,11 @@ PHONE_RE = re.compile(r"^(?:\+?38)?0?\d{9}$|^380\d{9}$")
 def normalize_phone(raw: str) -> Optional[str]:
     digits = re.sub(r"\D", "", raw or "")
     if digits.startswith("380") and len(digits) == 12:
-        return digits
+        return "+" + digits
     if digits.startswith("0") and len(digits) == 10:
-        return "38" + digits
+        return "+38" + digits
     if len(digits) == 9:
-        return "380" + digits
+        return "+380" + digits
     return None
 
 def a2i(v: Any, default: int = 0) -> int:
@@ -834,6 +834,508 @@ async def list_clients_by_filter(filter_type: str = "all") -> List[Dict[str, Any
 
         return [dict(row) for row in rows]
 
+# ===================== NEW FEATURES: INFO, BROADCAST, MOTIVATIONAL =============
+
+async def get_client_by_phone(phone: str) -> Optional[Dict[str, Any]]:
+    """Отримання клієнта по номеру телефону"""
+    normalized = normalize_phone(phone)
+    if not normalized:
+        return None
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM clients WHERE phone = $1",
+            normalized
+        )
+        return dict(row) if row else None
+
+async def get_client_full_info(client_id: int) -> Dict[str, Any]:
+    """Отримання повної інформації про клієнта для команди /info"""
+    async with db_pool.acquire() as conn:
+        # Основна інформація про клієнта
+        client = await conn.fetchrow(
+            "SELECT * FROM clients WHERE client_id = $1", client_id
+        )
+        if not client:
+            return None
+
+        client_data = dict(client)
+
+        # Історія конференцій (з деталями типів)
+        conferences_history = await conn.fetch(
+            """SELECT e.event_id, e.title, e.type, et.title AS type_name,
+                      e.start_at, a.attended, a.marked_at, r.rsvp
+               FROM events e
+               LEFT JOIN event_types et ON e.type = et.type_code
+               LEFT JOIN attendance a ON e.event_id = a.event_id AND a.client_id = $1
+               LEFT JOIN rsvp r ON e.event_id = r.event_id AND r.client_id = $1
+               WHERE (a.attended = TRUE OR r.rsvp IN ('going', 'declined'))
+               ORDER BY e.start_at DESC""",
+            client_id
+        )
+
+        # Історія запрошень з delivery_log
+        invitations_history = await conn.fetch(
+            """SELECT dl.ts, dl.event_id, dl.action, dl.details, e.title
+               FROM delivery_log dl
+               LEFT JOIN events e ON dl.event_id = e.event_id
+               WHERE dl.client_id = $1
+                 AND dl.action IN ('invite_sent', 'rsvp_yes', 'rsvp_no', 'reminded_24h', 'reminded_60m')
+               ORDER BY dl.ts DESC
+               LIMIT 20""",
+            client_id
+        )
+
+        # Оцінки та коментарі
+        feedback_list = await conn.fetch(
+            """SELECT e.title, e.start_at, f.stars, f.comment, f.created_at, f.owner
+               FROM feedback f
+               JOIN events e ON f.event_id = e.event_id
+               WHERE f.client_id = $1
+               ORDER BY e.start_at DESC""",
+            client_id
+        )
+
+        # Статистика
+        stats = await get_client_statistics(client_id)
+
+        return {
+            "client": client_data,
+            "conferences": [dict(row) for row in conferences_history],
+            "invitations": [dict(row) for row in invitations_history],
+            "feedback": [dict(row) for row in feedback_list],
+            "stats": stats
+        }
+
+async def format_client_info_message(info: Dict[str, Any]) -> str:
+    """Форматування повідомлення з інформацією про клієнта"""
+    client = info["client"]
+    stats = info["stats"]
+    conferences = info["conferences"]
+    feedback = info["feedback"]
+    invitations = info["invitations"]
+
+    # Персональні дані
+    status_emoji = "✅ Активний" if client['status'] == 'active' else "❌ Неактивний"
+    docs_emoji = "✅ Так" if client.get('documents_collected') else "❌ Ні"
+
+    text = f"""📊 ІНФОРМАЦІЯ ПРО КЛІЄНТА
+
+👤 Персональні дані:
+• ПІБ: {client['full_name']}
+• Телефон: {client['phone']}
+• Telegram ID: {client['tg_user_id']}
+• Статус: {status_emoji}
+• Реєстрація: {iso_dt(client['created_at'])}
+• Остання активність: {iso_dt(client['last_seen_at'])}
+• Документи зібрано: {docs_emoji}
+
+📈 Статистика:
+• Всього відвідано: {stats.get('attended_count', 0)} конференцій
+• Підтверджено (going): {stats.get('confirmed_count', 0)} запрошень
+"""
+
+    # Обчислюємо кількість відмов
+    declined_count = sum(1 for c in conferences if c.get('rsvp') == 'declined')
+    if declined_count > 0:
+        text += f"• Відхилено (declined): {declined_count} запрошень\n"
+
+    text += "\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    # Історія конференцій по типах
+    if conferences:
+        text += "📅 ІСТОРІЯ КОНФЕРЕНЦІЙ (по типах):\n\n"
+
+        # Групуємо по типах
+        by_type = {}
+        for conf in conferences:
+            type_code = conf['type']
+            if type_code not in by_type:
+                by_type[type_code] = []
+            by_type[type_code].append(conf)
+
+        type_icons = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣"}
+
+        for type_code in sorted(by_type.keys()):
+            confs = by_type[type_code]
+            type_name = confs[0].get('type_name', f'Тип {type_code}')
+            icon = type_icons.get(type_code, "▪️")
+
+            text += f"{icon} {type_name.upper()}\n"
+
+            for conf in confs:
+                if conf.get('attended'):
+                    visit_emoji = "✅"
+                    date_str = fmt_date(conf['start_at']) + " " + fmt_time(conf['start_at'])
+                    text += f"   {visit_emoji} {date_str} — Відвідав\n"
+
+                    # Шукаємо оцінку для цієї конференції
+                    fb = next((f for f in feedback if f['title'] == conf['title']), None)
+                    if fb and fb.get('stars'):
+                        stars = "⭐️" * fb['stars']
+                        text += f"   {stars} Оцінка: {fb['stars']} зірок\n"
+                        if fb.get('comment'):
+                            comment_preview = fb['comment'][:50] + "..." if len(fb['comment']) > 50 else fb['comment']
+                            text += f"   💬 \"{comment_preview}\"\n"
+                        if fb.get('owner'):
+                            text += f"   👤 Скаргу взяв у роботу: {fb['owner']}\n"
+                elif conf.get('rsvp') == 'declined':
+                    text += f"   ❌ {fmt_date(conf['start_at'])} — Відмовився\n"
+
+            text += "\n"
+
+    text += "━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    # Історія запрошень (скорочена)
+    if invitations:
+        text += "📬 ІСТОРІЯ ЗАПРОШЕНЬ (останні 10):\n\n"
+
+        for i, inv in enumerate(invitations[:10], 1):
+            action_text = {
+                'invite_sent': '📨 Запрошення',
+                'rsvp_yes': '✅ Підтвердив',
+                'rsvp_no': '❌ Відмовився',
+                'reminded_24h': '🔔 Нагадування 24г',
+                'reminded_60m': '🔔 Нагадування 60хв'
+            }.get(inv['action'], inv['action'])
+
+            event_title = inv.get('title', 'невідома подія')
+            text += f"{i}. {iso_dt(inv['ts'])} — {action_text} ({event_title})\n"
+
+        text += "\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    # Всі оцінки та коментарі
+    if feedback:
+        text += "⭐️ ВСІ ОЦІНКИ ТА КОМЕНТАРІ:\n\n"
+
+        for fb in feedback:
+            text += f"{fmt_date(fb['start_at'])} — {fb['title']}\n"
+            stars = "⭐️" * fb['stars']
+            text += f"{stars} ({fb['stars']}/5)\n"
+            if fb.get('comment'):
+                text += f"💬 {fb['comment']}\n"
+            if fb.get('owner'):
+                text += f"👤 В роботі у: {fb['owner']}\n"
+            text += "\n"
+
+        # Середня оцінка
+        avg_rating = sum(f['stars'] for f in feedback) / len(feedback)
+        text += f"━━━━━━━━━━━━━━━━━━━━━\n\n📊 СЕРЕДНЯ ОЦІНКА: {avg_rating:.1f}/5\n"
+
+    return text
+
+async def get_broadcast_segment_clients(segment: str) -> List[Dict[str, Any]]:
+    """Отримання списку клієнтів для певного сегменту розсилки"""
+    async with db_pool.acquire() as conn:
+        if segment == "all":
+            # Всі активні клієнти
+            rows = await conn.fetch(
+                "SELECT * FROM clients WHERE status = 'active' ORDER BY created_at DESC"
+            )
+
+        elif segment == "never":
+            # Ніколи не відвідували
+            rows = await conn.fetch(
+                """SELECT c.*
+                   FROM clients c
+                   WHERE c.status = 'active'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM attendance a
+                       WHERE a.client_id = c.client_id AND a.attended = TRUE
+                   )
+                   ORDER BY c.created_at DESC"""
+            )
+
+        elif segment.startswith("type_"):
+            # Відвідали певний тип конференції
+            type_code = int(segment.split("_")[1])
+            rows = await conn.fetch(
+                """SELECT DISTINCT c.*
+                   FROM clients c
+                   JOIN attendance a ON c.client_id = a.client_id
+                   JOIN events e ON a.event_id = e.event_id
+                   WHERE c.status = 'active'
+                   AND e.type = $1
+                   AND a.attended = TRUE
+                   ORDER BY c.created_at DESC""",
+                type_code
+            )
+
+        elif segment == "completed":
+            # Відвідали ВСІ типи
+            total_types = await conn.fetchval(
+                "SELECT COUNT(*) FROM event_types WHERE active = TRUE"
+            )
+            rows = await conn.fetch(
+                """SELECT c.*
+                   FROM clients c
+                   JOIN attendance a ON c.client_id = a.client_id
+                   JOIN events e ON a.event_id = e.event_id
+                   WHERE c.status = 'active' AND a.attended = TRUE
+                   GROUP BY c.client_id
+                   HAVING COUNT(DISTINCT e.type) >= $1
+                   ORDER BY c.last_seen_at DESC""",
+                total_types
+            )
+
+        elif segment == "inactive_30":
+            # Неактивні 30+ днів БЕЗ тих, хто завершив всі типи
+            total_types = await conn.fetchval(
+                "SELECT COUNT(*) FROM event_types WHERE active = TRUE"
+            )
+            rows = await conn.fetch(
+                """SELECT c.*
+                   FROM clients c
+                   WHERE c.status = 'active'
+                   AND c.last_seen_at < NOW() - INTERVAL '30 days'
+                   AND (
+                       SELECT COUNT(DISTINCT e.type)
+                       FROM attendance a
+                       JOIN events e ON a.event_id = e.event_id
+                       WHERE a.client_id = c.client_id AND a.attended = TRUE
+                   ) < $1
+                   ORDER BY c.last_seen_at ASC""",
+                total_types
+            )
+
+        elif segment == "low_ratings":
+            # З низькими оцінками (<4)
+            rows = await conn.fetch(
+                """SELECT DISTINCT c.*
+                   FROM clients c
+                   JOIN feedback f ON c.client_id = f.client_id
+                   WHERE c.status = 'active'
+                   AND f.stars < 4
+                   ORDER BY c.created_at DESC"""
+            )
+
+        else:
+            rows = []
+
+        return [dict(row) for row in rows]
+
+async def get_inactive_clients_for_motivation() -> List[Dict[str, Any]]:
+    """Отримання неактивних клієнтів для мотивуючих повідомлень"""
+    async with db_pool.acquire() as conn:
+        total_types = await conn.fetchval(
+            "SELECT COUNT(*) FROM event_types WHERE active = TRUE"
+        )
+
+        rows = await conn.fetch(
+            """SELECT c.client_id, c.full_name, c.phone, c.tg_user_id, c.last_seen_at, c.created_at,
+                   COUNT(DISTINCT a.event_id) AS attended_count,
+                   MAX(e.start_at) AS last_event_date
+               FROM clients c
+               LEFT JOIN attendance a ON c.client_id = a.client_id AND a.attended = TRUE
+               LEFT JOIN events e ON a.event_id = e.event_id
+               WHERE c.status = 'active'
+               AND c.created_at < NOW() - INTERVAL '7 days'
+               AND NOT EXISTS (
+                   SELECT 1 FROM rsvp r
+                   JOIN events e2 ON r.event_id = e2.event_id
+                   WHERE r.client_id = c.client_id
+                   AND r.rsvp = 'going'
+                   AND e2.start_at > NOW()
+               )
+               GROUP BY c.client_id
+               HAVING COUNT(DISTINCT e.type) < $1
+               AND (MAX(e.start_at) IS NULL OR MAX(e.start_at) < NOW() - INTERVAL '30 days')
+               AND COUNT(DISTINCT a.event_id) < 3""",
+            total_types
+        )
+
+        return [dict(row) for row in rows]
+
+async def get_last_motivational_message(client_id: int) -> Optional[Dict[str, Any]]:
+    """Отримання останнього мотивуючого повідомлення для клієнта"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT ts, details
+               FROM delivery_log
+               WHERE client_id = $1 AND action = 'motivational_sent'
+               ORDER BY ts DESC
+               LIMIT 1""",
+            client_id
+        )
+        if row:
+            import json
+            details = json.loads(row['details']) if isinstance(row['details'], str) else row['details']
+            return {"ts": row['ts'], "details": details}
+        return None
+
+async def send_broadcast_to_clients(clients: List[Dict[str, Any]], message_text: str,
+                                   segment: str, manager_id: int,
+                                   progress_callback=None) -> Dict[str, Any]:
+    """Відправка розсилки клієнтам з прогресом"""
+    import json
+
+    total = len(clients)
+    sent = 0
+    failed = 0
+    blocked = []
+
+    for i, client in enumerate(clients):
+        try:
+            await bot.send_message(client['tg_user_id'], message_text, parse_mode=None)
+            sent += 1
+
+            # Логування
+            await log_action(
+                "broadcast_sent",
+                client_id=client['client_id'],
+                details=json.dumps({"segment": segment, "manager_id": manager_id})
+            )
+
+            # Затримка для rate limiting (30 msg/sec = ~35ms)
+            await asyncio.sleep(0.035)
+
+        except TelegramForbiddenError:
+            # Клієнт заблокував бота
+            failed += 1
+            blocked.append(client)
+
+            # Позначаємо клієнта неактивним
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE clients SET status = 'inactive' WHERE client_id = $1",
+                    client['client_id']
+                )
+
+            await log_action(
+                "broadcast_failed",
+                client_id=client['client_id'],
+                details="blocked_bot"
+            )
+
+        except Exception as e:
+            failed += 1
+            await log_action(
+                "broadcast_failed",
+                client_id=client['client_id'],
+                details=str(e)
+            )
+
+        # Callback для оновлення прогресу
+        if progress_callback and (i + 1) % 10 == 0:
+            await progress_callback(i + 1, total)
+
+    return {
+        "total": total,
+        "sent": sent,
+        "failed": failed,
+        "blocked": blocked
+    }
+
+# Глобальна змінна для контролю мотивуючих повідомлень
+MOTIVATIONAL_ENABLED = True
+
+async def send_motivational_messages():
+    """Відправка мотивуючих повідомлень неактивним клієнтам (запускається в scheduler)"""
+    import json
+
+    if not MOTIVATIONAL_ENABLED:
+        return
+
+    try:
+        inactive_clients = await get_inactive_clients_for_motivation()
+
+        for client in inactive_clients:
+            # Отримати останнє мотивуюче повідомлення
+            last_motivational = await get_last_motivational_message(client['client_id'])
+
+            if last_motivational is None:
+                # Перше повідомлення
+                next_key = "motivational.1"
+                days_since_registration = (now_kyiv() - client['created_at']).days
+
+                if days_since_registration < 7:
+                    continue
+            else:
+                # Перевірити, чи пройшло 3 дні
+                days_since_last = (now_kyiv() - last_motivational['ts']).days
+
+                if days_since_last < 3:
+                    continue
+
+                # Наступне повідомлення
+                last_key = last_motivational['details'].get('message_key', 'motivational.1')
+                last_number = int(last_key.split('.')[1])
+
+                if last_number >= 5:
+                    continue  # Вже відправили всі 5
+
+                next_key = f"motivational.{last_number + 1}"
+
+            # Відправити повідомлення
+            message_text = await messages_get(next_key, 'uk')
+
+            if not message_text:
+                continue
+
+            try:
+                await bot.send_message(client['tg_user_id'], message_text, parse_mode=None)
+
+                # Логуємо
+                await log_action(
+                    "motivational_sent",
+                    client_id=client['client_id'],
+                    details=json.dumps({"message_key": next_key})
+                )
+
+            except TelegramForbiddenError:
+                # Клієнт заблокував бота
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE clients SET status = 'inactive' WHERE client_id = $1",
+                        client['client_id']
+                    )
+
+            except Exception:
+                pass
+
+    except Exception as e:
+        print(f"Error in send_motivational_messages: {e}")
+
+async def get_motivational_statistics(days: int = 30) -> Dict[str, Any]:
+    """Отримання статистики мотивуючих повідомлень"""
+    import json
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT
+                   details,
+                   COUNT(*) as sent_count,
+                   COUNT(CASE
+                       WHEN EXISTS (
+                           SELECT 1 FROM attendance a
+                           JOIN events e ON a.event_id = e.event_id
+                           WHERE a.client_id = dl.client_id
+                             AND a.attended = TRUE
+                             AND e.start_at BETWEEN dl.ts AND dl.ts + INTERVAL '7 days'
+                       ) THEN 1
+                   END) as conversion_count
+               FROM delivery_log dl
+               WHERE dl.action = 'motivational_sent'
+               AND dl.ts >= NOW() - INTERVAL '1 day' * $1
+               GROUP BY details
+               ORDER BY details""",
+            days
+        )
+
+        stats = []
+        for row in rows:
+            details = json.loads(row['details']) if isinstance(row['details'], str) else row['details']
+            message_key = details.get('message_key', 'unknown')
+
+            stats.append({
+                "message_key": message_key,
+                "sent_count": row['sent_count'],
+                "conversion_count": row['conversion_count'],
+                "conversion_rate": (row['conversion_count'] / row['sent_count'] * 100) if row['sent_count'] > 0 else 0
+            })
+
+        return {"stats": stats, "days": days}
+
 # ============================== KEYBOARDS ======================================
 
 def kb_admin_main() -> InlineKeyboardMarkup:
@@ -841,6 +1343,8 @@ def kb_admin_main() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="➕ Додати конференцію", callback_data="admin:add")],
         [InlineKeyboardButton(text="📋 Список конференцій", callback_data="admin:list:0")],
         [InlineKeyboardButton(text="👥 Клієнти", callback_data="admin:clients:menu")],
+        [InlineKeyboardButton(text="📢 Розсилка", callback_data="broadcast:menu")],
+        [InlineKeyboardButton(text="💬 Мотивуючі повідомлення", callback_data="motivational:menu")],
     ])
 
 def kb_rsvp(event_id: int) -> InlineKeyboardMarkup:
@@ -913,6 +1417,75 @@ def kb_client_detail(client_id: int, status: str = "active", documents_collected
         [InlineKeyboardButton(text="⬅️ Назад до списку", callback_data="admin:clients:menu")],
     ])
 
+# Клавіатури для розсилок
+def kb_broadcast_segments() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1️⃣ Всі активні клієнти", callback_data="broadcast:segment:all")],
+        [InlineKeyboardButton(text="2️⃣ Ніколи не відвідували", callback_data="broadcast:segment:never")],
+        [InlineKeyboardButton(text="3️⃣ Відвідали ЗБІР ДОКУМЕНТІВ (тип 1)", callback_data="broadcast:segment:type_1")],
+        [InlineKeyboardButton(text="4️⃣ Відвідали СЛУЖБА БЕЗПЕКИ (тип 2)", callback_data="broadcast:segment:type_2")],
+        [InlineKeyboardButton(text="5️⃣ Відвідали ПІДГОТОВКА ІСТОРІЇ (тип 3)", callback_data="broadcast:segment:type_3")],
+        [InlineKeyboardButton(text="6️⃣ Відвідали ДОКУМЕНТИ РАЗОМ (тип 4)", callback_data="broadcast:segment:type_4")],
+        [InlineKeyboardButton(text="7️⃣ Відвідали ВСІ типи (завершили)", callback_data="broadcast:segment:completed")],
+        [InlineKeyboardButton(text="8️⃣ Неактивні 30+ днів", callback_data="broadcast:segment:inactive_30")],
+        [InlineKeyboardButton(text="9️⃣ З низькими оцінками (<4)", callback_data="broadcast:segment:low_ratings")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin:home")],
+    ])
+
+def kb_broadcast_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Продовжити", callback_data="broadcast:confirm:yes")],
+        [InlineKeyboardButton(text="🔙 Обрати інший", callback_data="broadcast:menu")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin:home")],
+    ])
+
+def kb_broadcast_preview() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 ЗАПУСТИТИ", callback_data="broadcast:send:confirm")],
+        [InlineKeyboardButton(text="✏️ Редагувати", callback_data="broadcast:edit:text")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin:home")],
+    ])
+
+# Клавіатури для мотивуючих повідомлень
+def kb_motivational_menu() -> InlineKeyboardMarkup:
+    global MOTIVATIONAL_ENABLED
+    toggle_text = "⏸ Призупинити розсилку" if MOTIVATIONAL_ENABLED else "▶️ Увімкнути розсилку"
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Редагувати тексти", callback_data="motivational:edit:menu")],
+        [InlineKeyboardButton(text="📊 Статистика відправок", callback_data="motivational:stats")],
+        [InlineKeyboardButton(text=toggle_text, callback_data="motivational:toggle")],
+        [InlineKeyboardButton(text="🧪 Тестова відправка", callback_data="motivational:test:menu")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin:home")],
+    ])
+
+def kb_motivational_edit_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1️⃣ Повідомлення №1 (день 7)", callback_data="motivational:edit:1")],
+        [InlineKeyboardButton(text="2️⃣ Повідомлення №2 (день 10)", callback_data="motivational:edit:2")],
+        [InlineKeyboardButton(text="3️⃣ Повідомлення №3 (день 13)", callback_data="motivational:edit:3")],
+        [InlineKeyboardButton(text="4️⃣ Повідомлення №4 (день 16)", callback_data="motivational:edit:4")],
+        [InlineKeyboardButton(text="5️⃣ Повідомлення №5 (день 19)", callback_data="motivational:edit:5")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="motivational:menu")],
+    ])
+
+def kb_motivational_edit_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Зберегти", callback_data="motivational:save:yes")],
+        [InlineKeyboardButton(text="✏️ Редагувати", callback_data="motivational:save:edit")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="motivational:menu")],
+    ])
+
+def kb_motivational_test_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1️⃣ Повідомлення №1", callback_data="motivational:test:1")],
+        [InlineKeyboardButton(text="2️⃣ Повідомлення №2", callback_data="motivational:test:2")],
+        [InlineKeyboardButton(text="3️⃣ Повідомлення №3", callback_data="motivational:test:3")],
+        [InlineKeyboardButton(text="4️⃣ Повідомлення №4", callback_data="motivational:test:4")],
+        [InlineKeyboardButton(text="5️⃣ Повідомлення №5", callback_data="motivational:test:5")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="motivational:menu")],
+    ])
+
 # ============================== STATE / MEMORY =================================
 
 ADMINS: set[int] = set()
@@ -934,6 +1507,14 @@ class AdminEditFieldSG(StatesGroup):
 
 class FeedbackSG(StatesGroup):
     wait_comment = State()
+
+class BroadcastSG(StatesGroup):
+    wait_message = State()
+    preview = State()
+
+class MotivationalEditSG(StatesGroup):
+    wait_text = State()
+    preview = State()
 
 # ================================ BOT/DP =======================================
 
@@ -2190,6 +2771,421 @@ async def send_initial_invites_for_event(event: Dict[str, Any]):
 
     await log_action("invite_process_complete", event_id=event_id, details=f"Sent={sent_count}, Skipped={skip_reasons}")
 
+# =================== NEW HANDLERS: /info, BROADCAST, MOTIVATIONAL ==============
+
+# Обробник команди /info
+@dp.message(Command("info"))
+async def cmd_info(m: Message, state: FSMContext):
+    """Команда /info +380********* для отримання інформації про клієнта"""
+    if m.from_user.id not in ADMINS:
+        await m.answer("❌ Ця команда доступна тільки адміністраторам.")
+        return
+
+    # Парсинг номеру телефону
+    args = (m.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await m.answer("📞 Використання: /info +380123456789")
+        return
+
+    phone = args[1].strip()
+
+    # Шукаємо клієнта
+    client = await get_client_by_phone(phone)
+
+    if not client:
+        await m.answer(f"❌ Клієнта з номером {phone} не знайдено в базі даних.")
+        return
+
+    # Отримуємо повну інформацію
+    info = await get_client_full_info(client['client_id'])
+
+    if not info:
+        await m.answer("❌ Помилка отримання інформації про клієнта.")
+        return
+
+    # Форматуємо та відправляємо
+    text = await format_client_info_message(info)
+
+    # Telegram обмежує повідомлення до 4096 символів
+    if len(text) > 4096:
+        # Розбиваємо на частини
+        parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        for part in parts:
+            await m.answer(part, parse_mode=None)
+    else:
+        await m.answer(text, parse_mode=None)
+
+# Обробники розсилок
+@dp.callback_query(F.data == "broadcast:menu")
+async def broadcast_menu(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    await state.clear()
+    await c.message.edit_text(
+        "🎯 ОБЕРІТЬ СЕГМЕНТ КЛІЄНТІВ:",
+        reply_markup=kb_broadcast_segments()
+    )
+
+@dp.callback_query(F.data.startswith("broadcast:segment:"))
+async def broadcast_select_segment(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    segment = c.data.split(":")[2]
+
+    # Отримуємо клієнтів для сегменту
+    clients = await get_broadcast_segment_clients(segment)
+
+    if not clients:
+        await c.message.edit_text(
+            f"⚠️ Для сегменту '{segment}' не знайдено жодного клієнта.\n\nОберіть інший сегмент.",
+            reply_markup=kb_broadcast_segments()
+        )
+        return
+
+    # Зберігаємо сегмент та клієнтів
+    await state.update_data(segment=segment, clients=clients)
+
+    # Назва сегменту
+    segment_names = {
+        "all": "Всі активні клієнти",
+        "never": "Ніколи не відвідували конференції",
+        "type_1": "Відвідали ЗБІР ДОКУМЕНТІВ (тип 1)",
+        "type_2": "Відвідали СЛУЖБА БЕЗПЕКИ (тип 2)",
+        "type_3": "Відвідали ПІДГОТОВКА ІСТОРІЇ (тип 3)",
+        "type_4": "Відвідали ДОКУМЕНТИ РАЗОМ (тип 4)",
+        "completed": "Відвідали ВСІ типи (завершили)",
+        "inactive_30": "Неактивні 30+ днів (не завершили)",
+        "low_ratings": "З низькими оцінками (<4)"
+    }
+
+    segment_name = segment_names.get(segment, segment)
+
+    # Показуємо попередній перегляд
+    preview_text = f"🎯 Сегмент: {segment_name}\n\n📊 Знайдено клієнтів: {len(clients)}\n\n📋 Приклади (перші 5):\n"
+    for i, client in enumerate(clients[:5], 1):
+        preview_text += f"{i}. {client['full_name']} ({client['phone']}) — рег. {fmt_date(client['created_at'])}\n"
+
+    if len(clients) > 5:
+        preview_text += f"...\n\n⚠️ Переконайтесь, що обрано правильний сегмент!"
+
+    await c.message.edit_text(preview_text, reply_markup=kb_broadcast_confirm())
+
+@dp.callback_query(F.data == "broadcast:confirm:yes")
+async def broadcast_confirm_yes(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    await c.message.edit_text(
+        "✍️ Напишіть текст повідомлення для розсилки:\n\n"
+        "Підтримуються:\n"
+        "• Текст (до 4096 символів)\n"
+        "• Emoji\n"
+        "• Посилання\n\n"
+        "🚫 Надішліть /cancel для скасування",
+        reply_markup=None
+    )
+    await state.set_state(BroadcastSG.wait_message)
+
+@dp.message(BroadcastSG.wait_message, F.text == "/cancel")
+async def broadcast_cancel(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("❌ Розсилка скасована.", reply_markup=kb_admin_main())
+
+@dp.message(BroadcastSG.wait_message)
+async def broadcast_receive_message(m: Message, state: FSMContext):
+    if m.from_user.id not in ADMINS:
+        return
+
+    message_text = m.text
+
+    if len(message_text) > 4096:
+        await m.answer("⚠️ Повідомлення занадто довге. Максимум 4096 символів.")
+        return
+
+    # Зберігаємо текст
+    await state.update_data(message_text=message_text)
+    data = await state.get_data()
+    clients = data.get('clients', [])
+
+    # Показуємо попередній перегляд
+    preview = f"👀 ПОПЕРЕДНІЙ ПЕРЕГЛЯД ПОВІДОМЛЕННЯ:\n\n────────────────────────\n{message_text}\n────────────────────────\n\n"
+    preview += f"📊 Буде надіслано: {len(clients)} клієнтам\n"
+    preview += f"⏱ Приблизний час: ~{len(clients) * 0.035 / 60:.0f} хвилин"
+
+    await m.answer(preview, reply_markup=kb_broadcast_preview(), parse_mode=None)
+    await state.set_state(BroadcastSG.preview)
+
+@dp.callback_query(F.data == "broadcast:edit:text", BroadcastSG.preview)
+async def broadcast_edit_text(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    await c.message.edit_text(
+        "✍️ Напишіть новий текст повідомлення для розсилки:\n\n🚫 Надішліть /cancel для скасування"
+    )
+    await state.set_state(BroadcastSG.wait_message)
+
+@dp.callback_query(F.data == "broadcast:send:confirm", BroadcastSG.preview)
+async def broadcast_send_confirm(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    data = await state.get_data()
+    clients = data.get('clients', [])
+    message_text = data.get('message_text', '')
+    segment = data.get('segment', 'unknown')
+
+    if not clients or not message_text:
+        await c.answer("❌ Помилка: дані розсилки не знайдено")
+        return
+
+    # Починаємо розсилку
+    progress_msg = await c.message.edit_text(f"⏳ Запускаю розсилку...\n\n📨 Надіслано: 0/{len(clients)} (0%)")
+
+    # Callback для оновлення прогресу
+    async def update_progress(sent, total):
+        percentage = int(sent / total * 100)
+        bar_length = 20
+        filled = int(bar_length * sent / total)
+        bar = "▓" * filled + "░" * (bar_length - filled)
+
+        text = f"⏳ Відправка...\n\n📨 Надіслано: {sent}/{total} ({percentage}%)\n{bar}"
+        try:
+            await progress_msg.edit_text(text)
+        except:
+            pass
+
+    # Запускаємо розсилку
+    start_time = datetime.now()
+    result = await send_broadcast_to_clients(
+        clients, message_text, segment, c.from_user.id, update_progress
+    )
+    end_time = datetime.now()
+
+    duration = (end_time - start_time).total_seconds()
+
+    # Фінальний звіт
+    report = f"✅ РОЗСИЛКА ЗАВЕРШЕНА!\n\n📊 Результати:\n"
+    report += f"✅ Успішно надіслано: {result['sent']}\n"
+    report += f"❌ Помилка доставки: {result['failed']}\n"
+
+    if result['blocked']:
+        report += f"  └─ Бот заблоковано: {len(result['blocked'])}\n"
+
+    report += f"\n⏱ Час виконання: {int(duration // 60)} хвилин {int(duration % 60)} секунд\n"
+
+    if result['blocked']:
+        report += "\n━━━━━━━━━━━━━━━━━━━━━\n\n📋 Заблокували бота (позначені неактивними):\n"
+        for i, client in enumerate(result['blocked'][:10], 1):
+            report += f"{i}. {client['full_name']} ({client['phone']})\n"
+        if len(result['blocked']) > 10:
+            report += f"... та ще {len(result['blocked']) - 10}\n"
+
+    report += "\n💾 Збережено в delivery_log"
+
+    await progress_msg.edit_text(report, reply_markup=kb_admin_main())
+    await state.clear()
+
+# Обробники мотивуючих повідомлень
+@dp.callback_query(F.data == "motivational:menu")
+async def motivational_menu(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    await state.clear()
+    await c.message.edit_text(
+        "📢 МОТИВУЮЧІ ПОВІДОМЛЕННЯ\n\nОберіть дію:",
+        reply_markup=kb_motivational_menu()
+    )
+
+@dp.callback_query(F.data == "motivational:toggle")
+async def motivational_toggle(c: CallbackQuery):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    global MOTIVATIONAL_ENABLED
+    MOTIVATIONAL_ENABLED = not MOTIVATIONAL_ENABLED
+
+    status = "УВІМКНЕНО" if MOTIVATIONAL_ENABLED else "ПРИЗУПИНЕНО"
+    emoji = "✅" if MOTIVATIONAL_ENABLED else "⏸"
+
+    await c.message.edit_text(
+        f"{emoji} Мотивуючі повідомлення {status}\n\n"
+        f"Розсилка {'відновлена' if MOTIVATIONAL_ENABLED else 'призупинена'}.",
+        reply_markup=kb_motivational_menu()
+    )
+
+@dp.callback_query(F.data == "motivational:stats")
+async def motivational_stats(c: CallbackQuery):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    stats = await get_motivational_statistics(30)
+
+    if not stats['stats']:
+        await c.message.edit_text(
+            "📊 СТАТИСТИКА МОТИВУЮЧИХ ПОВІДОМЛЕНЬ\n\n"
+            "За останні 30 днів:\n\n"
+            "⚠️ Немає даних про відправлення.",
+            reply_markup=kb_motivational_menu()
+        )
+        return
+
+    text = "📊 СТАТИСТИКА МОТИВУЮЧИХ ПОВІДОМЛЕНЬ\n\nЗа останні 30 днів:\n\n"
+
+    total_sent = 0
+    total_conversions = 0
+
+    for stat in stats['stats']:
+        msg_num = stat['message_key'].split('.')[-1]
+        text += f"Повідомлення №{msg_num}: {stat['sent_count']} відправок → {stat['conversion_count']} конверсій ({stat['conversion_rate']:.1f}%)\n"
+        total_sent += stat['sent_count']
+        total_conversions += stat['conversion_count']
+
+    if total_sent > 0:
+        total_rate = (total_conversions / total_sent * 100)
+        text += f"\n━━━━━━━━━━━━━━━━━━━━\n\n📈 Всього конверсій: {total_conversions} ({total_rate:.1f}%)\n"
+        text += f"👥 Всього отримувачів: {total_sent}\n\n"
+        text += "Конверсія = клієнт відвідав конференцію протягом 7 днів після повідомлення"
+
+    await c.message.edit_text(text, reply_markup=kb_motivational_menu())
+
+@dp.callback_query(F.data == "motivational:edit:menu")
+async def motivational_edit_menu(c: CallbackQuery):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    await c.message.edit_text(
+        "✏️ РЕДАГУВАННЯ МОТИВУЮЧИХ ПОВІДОМЛЕНЬ\n\nОберіть повідомлення для редагування:",
+        reply_markup=kb_motivational_edit_menu()
+    )
+
+@dp.callback_query(F.data.startswith("motivational:edit:") and F.data[-1].isdigit())
+async def motivational_edit_start(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    msg_num = c.data.split(":")[-1]
+    msg_key = f"motivational.{msg_num}"
+
+    # Отримуємо поточний текст
+    current_text = await messages_get(msg_key, 'uk')
+
+    await state.update_data(message_key=msg_key, message_num=msg_num)
+
+    await c.message.edit_text(
+        f"📝 ПОВІДОМЛЕННЯ №{msg_num}\n\nПоточний текст:\n────────────────────────\n{current_text}\n────────────────────────\n\n"
+        f"Надішліть новий текст або /cancel для скасування:",
+        reply_markup=None
+    )
+
+    await state.set_state(MotivationalEditSG.wait_text)
+
+@dp.message(MotivationalEditSG.wait_text, F.text == "/cancel")
+async def motivational_edit_cancel(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("❌ Редагування скасовано.", reply_markup=kb_motivational_menu())
+
+@dp.message(MotivationalEditSG.wait_text)
+async def motivational_edit_receive_text(m: Message, state: FSMContext):
+    if m.from_user.id not in ADMINS:
+        return
+
+    new_text = m.text
+    await state.update_data(new_text=new_text)
+    data = await state.get_data()
+    msg_num = data.get('message_num')
+
+    preview = f"👀 ПОПЕРЕДНІЙ ПЕРЕГЛЯД\n\nПовідомлення №{msg_num}:\n────────────────────────\n{new_text}\n────────────────────────"
+
+    await m.answer(preview, reply_markup=kb_motivational_edit_confirm(), parse_mode=None)
+    await state.set_state(MotivationalEditSG.preview)
+
+@dp.callback_query(F.data == "motivational:save:edit", MotivationalEditSG.preview)
+async def motivational_save_edit(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    data = await state.get_data()
+    msg_num = data.get('message_num')
+
+    await c.message.edit_text(
+        f"✏️ Надішліть новий текст для повідомлення №{msg_num}:",
+        reply_markup=None
+    )
+    await state.set_state(MotivationalEditSG.wait_text)
+
+@dp.callback_query(F.data == "motivational:save:yes", MotivationalEditSG.preview)
+async def motivational_save_yes(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    data = await state.get_data()
+    msg_key = data.get('message_key')
+    msg_num = data.get('message_num')
+    new_text = data.get('new_text')
+
+    # Оновлюємо в БД
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE messages SET text = $1 WHERE key = $2 AND lang = 'uk'",
+            new_text, msg_key
+        )
+
+    await c.message.edit_text(
+        f"✅ Текст повідомлення №{msg_num} оновлено!",
+        reply_markup=kb_motivational_menu()
+    )
+    await state.clear()
+
+@dp.callback_query(F.data == "motivational:test:menu")
+async def motivational_test_menu(c: CallbackQuery):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    await c.message.edit_text(
+        "🧪 ТЕСТОВА ВІДПРАВКА\n\nОберіть повідомлення для тестування:",
+        reply_markup=kb_motivational_test_menu()
+    )
+
+@dp.callback_query(F.data.startswith("motivational:test:") and F.data[-1].isdigit())
+async def motivational_test_send(c: CallbackQuery):
+    if c.from_user.id not in ADMINS:
+        await c.answer("❌ Доступ заборонено")
+        return
+
+    msg_num = c.data.split(":")[-1]
+    msg_key = f"motivational.{msg_num}"
+
+    # Отримуємо текст
+    text = await messages_get(msg_key, 'uk')
+
+    if not text:
+        await c.answer("❌ Повідомлення не знайдено")
+        return
+
+    # Відправляємо менеджеру
+    try:
+        await bot.send_message(c.from_user.id, text, parse_mode=None)
+        await c.answer(f"✅ Тестове повідомлення №{msg_num} надіслано!", show_alert=True)
+    except Exception as e:
+        await c.answer(f"❌ Помилка: {e}", show_alert=True)
+
 # =============================== SCHEDULER TICK ================================
 
 async def scheduler_tick():
@@ -2317,6 +3313,10 @@ async def scheduler_tick():
                             await log_action("post_event_survey_sent", client_id=cid, event_id=e["event_id"])
                         except Exception:
                             pass
+
+        # Мотивуючі повідомлення (запускаємо кожну годину)
+        if now.minute == 0:  # На початку кожної години
+            await send_motivational_messages()
 
     except Exception as e:
         import traceback
