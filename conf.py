@@ -896,9 +896,9 @@ async def get_client_full_info(client_id: int) -> Dict[str, Any]:
             client_id
         )
 
-        # Статистика - рахуємо всі запрошення з rsvp
+        # Статистика - рахуємо всі запрошення з логів відправки
         total_invites = await conn.fetchval(
-            "SELECT COUNT(*) FROM rsvp WHERE client_id = $1",
+            "SELECT COUNT(*) FROM delivery_log WHERE client_id = $1 AND action = 'invite_sent'",
             client_id
         )
 
