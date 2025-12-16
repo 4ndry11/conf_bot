@@ -1741,9 +1741,8 @@ async def admin_add_wait_link(m: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "admin:home")
 async def admin_home(q: CallbackQuery):
-    if q.from_user.id not in ADMINS:
-        await q.answer()
-        return
+    # Додаємо користувача в ADMINS якщо він натискає кнопки адмін-панелі
+    ADMINS.add(q.from_user.id)
     await q.message.edit_text("Адмін-панель:", reply_markup=kb_admin_main())
     await q.answer()
 
@@ -2777,6 +2776,10 @@ async def send_initial_invites_for_event(event: Dict[str, Any]):
 @dp.message(Command("info"))
 async def cmd_info(m: Message, state: FSMContext):
     """Команда /info +380********* для отримання інформації про клієнта"""
+    if m.from_user.id not in ADMINS:
+        await m.answer("❌ Ця команда доступна тільки адміністраторам.")
+        return
+
     # Парсинг номеру телефону
     args = (m.text or "").split(maxsplit=1)
     if len(args) < 2:
@@ -2814,9 +2817,8 @@ async def cmd_info(m: Message, state: FSMContext):
 # Обробники розсилок
 @dp.callback_query(F.data == "broadcast:menu")
 async def broadcast_menu(c: CallbackQuery, state: FSMContext):
-    if c.from_user.id not in ADMINS:
-        await c.answer("❌ Доступ заборонено")
-        return
+    # Додаємо користувача в ADMINS
+    ADMINS.add(c.from_user.id)
 
     await state.clear()
     await c.message.edit_text(
@@ -2992,9 +2994,8 @@ async def broadcast_send_confirm(c: CallbackQuery, state: FSMContext):
 # Обробники мотивуючих повідомлень
 @dp.callback_query(F.data == "motivational:menu")
 async def motivational_menu(c: CallbackQuery, state: FSMContext):
-    if c.from_user.id not in ADMINS:
-        await c.answer("❌ Доступ заборонено")
-        return
+    # Додаємо користувача в ADMINS
+    ADMINS.add(c.from_user.id)
 
     await state.clear()
     await c.message.edit_text(
