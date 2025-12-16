@@ -896,15 +896,30 @@ async def get_client_full_info(client_id: int) -> Dict[str, Any]:
             client_id
         )
 
-        # Статистика
-        stats = await get_client_statistics(client_id)
+        # Статистика - рахуємо всі запрошення з rsvp
+        total_invites = await conn.fetchval(
+            "SELECT COUNT(*) FROM rsvp WHERE client_id = $1",
+            client_id
+        )
+
+        attended_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM attendance WHERE client_id = $1 AND attended = TRUE",
+            client_id
+        )
+
+        declined_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM rsvp WHERE client_id = $1 AND rsvp = 'declined'",
+            client_id
+        )
 
         return {
             "client": client_data,
             "conferences": [dict(row) for row in conferences_history],
             "invitations": [dict(row) for row in invitations_history],
             "feedback": [dict(row) for row in feedback_list],
-            "stats": stats
+            "total_invites": total_invites or 0,
+            "attended_count": attended_count or 0,
+            "declined_count": declined_count or 0
         }
 
 async def format_client_info_message(info: Dict[str, Any]) -> str:
@@ -928,16 +943,10 @@ async def format_client_info_message(info: Dict[str, Any]) -> str:
 • Остання активність: {fmt_date(client['last_seen_at'])} {fmt_time(client['last_seen_at'])}
 
 📈 Статистика:
+• Всього запрошень: {info['total_invites']}
+• Відвідано: {info['attended_count']} конференцій
+• Відхилено: {info['declined_count']} запрошень
 """
-
-    # Рахуємо статистику правильно
-    total_invites = sum(1 for inv in invitations if inv.get('action') == 'invite_sent')
-    attended_count = sum(1 for c in conferences if c.get('attended') == True)
-    declined_count = sum(1 for c in conferences if c.get('rsvp') == 'declined')
-
-    text += f"• Всього запрошень: {total_invites}\n"
-    text += f"• Відвідано: {attended_count} конференцій\n"
-    text += f"• Відхилено: {declined_count} запрошень\n"
 
     text += "\n━━━━━━━━━━━━━━━━━━━━━\n\n"
 
