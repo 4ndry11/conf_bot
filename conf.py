@@ -121,11 +121,11 @@ PHONE_RE = re.compile(r"^(?:\+?38)?0?\d{9}$|^380\d{9}$")
 def normalize_phone(raw: str) -> Optional[str]:
     digits = re.sub(r"\D", "", raw or "")
     if digits.startswith("380") and len(digits) == 12:
-        return "+" + digits
+        return digits
     if digits.startswith("0") and len(digits) == 10:
-        return "+38" + digits
+        return "38" + digits
     if len(digits) == 9:
-        return "+380" + digits
+        return "380" + digits
     return None
 
 def a2i(v: Any, default: int = 0) -> int:
